@@ -2,7 +2,7 @@
 Instagram Follower Scraper API
 
 A Flask API that provides functionality to scrape Instagram followers from specified accounts,
-detect their gender, and filter them based on gender preferences.
+detect their gender, filter them based on gender preferences, and persist to Supabase.
 """
 
 from flask import Flask, request, jsonify
@@ -14,6 +14,8 @@ import pandas as pd
 import gender_guesser.detector as gender
 import re
 from typing import Optional, List, Dict, Any
+from supabase import create_client, Client
+from datetime import datetime
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,6 +23,23 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
+
+
+# Initialize Supabase client
+def get_supabase_client() -> Client:
+    """
+    Initialize and return Supabase client using service role key.
+    
+    Returns:
+        Supabase client instance
+    """
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+    
+    if not supabase_url or not supabase_key:
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
+    
+    return create_client(supabase_url, supabase_key)
 
 
 def scrape_followers(accounts: list) -> dict:
@@ -354,6 +373,135 @@ def scrape_followers_api():
         
     except Exception as e:
         print(f"Error processing request: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/ingest', methods=['POST'])
+def ingest_profiles():
+    """
+    API endpoint to ingest scraped profiles into Supabase.
+    
+    This endpoint is idempotent: calling it multiple times with the same profiles
+    will not create duplicates in global_usernames.
+    
+    Expected JSON payload:
+    {
+        "profiles": [
+            {
+                "id": "123456",
+                "username": "john_doe",
+                "full_name": "John Doe"
+            }
+        ]
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "inserted_raw": 10,
+        "added_to_global": 8,
+        "skipped_existing": 2
+    }
+    """
+    try:
+        # Get JSON data from request
+        data = request.get_json()
+        
+        if not data or 'profiles' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing "profiles" field in request body'
+            }), 400
+        
+        profiles = data['profiles']
+        
+        if not isinstance(profiles, list):
+            return jsonify({
+                'success': False,
+                'error': 'Profiles must be a list'
+            }), 400
+        
+        if len(profiles) == 0:
+            return jsonify({
+                'success': True,
+                'inserted_raw': 0,
+                'added_to_global': 0,
+                'skipped_existing': 0
+            })
+        
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Counters for response
+        inserted_raw = 0
+        added_to_global = 0
+        skipped_existing = 0
+        
+        # Process each profile
+        for profile in profiles:
+            # Validate required fields
+            if 'id' not in profile or 'username' not in profile:
+                print(f"Warning: Skipping profile with missing id or username: {profile}")
+                continue
+            
+            profile_id = str(profile['id'])
+            username = profile['username']
+            full_name = profile.get('full_name', '')
+            
+            # Step 1: Insert into raw_scraped_profiles
+            try:
+                supabase.table('raw_scraped_profiles').insert({
+                    'id': profile_id,
+                    'username': username,
+                    'full_name': full_name,
+                    'scraped_at': datetime.utcnow().isoformat()
+                }).execute()
+                inserted_raw += 1
+                print(f"✓ Inserted {username} into raw_scraped_profiles")
+            except Exception as e:
+                print(f"Warning: Failed to insert {username} into raw_scraped_profiles: {str(e)}")
+            
+            # Step 2: Check if profile exists in global_usernames
+            try:
+                existing = supabase.table('global_usernames')\
+                    .select('id')\
+                    .eq('id', profile_id)\
+                    .execute()
+                
+                if existing.data and len(existing.data) > 0:
+                    # Profile already exists in global_usernames
+                    skipped_existing += 1
+                    print(f"○ Skipped {username} (already in global_usernames)")
+                else:
+                    # Profile doesn't exist, insert it
+                    supabase.table('global_usernames').insert({
+                        'id': profile_id,
+                        'username': username,
+                        'full_name': full_name,
+                        'used': False,
+                        'created_at': datetime.utcnow().isoformat()
+                    }).execute()
+                    added_to_global += 1
+                    print(f"✓ Added {username} to global_usernames")
+                    
+            except Exception as e:
+                print(f"Warning: Failed to process {username} for global_usernames: {str(e)}")
+                skipped_existing += 1
+        
+        return jsonify({
+            'success': True,
+            'inserted_raw': inserted_raw,
+            'added_to_global': added_to_global,
+            'skipped_existing': skipped_existing
+        })
+        
+    except Exception as e:
+        print(f"Error processing ingest request: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             'success': False,
             'error': str(e)
