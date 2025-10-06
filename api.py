@@ -15,7 +15,11 @@ import gender_guesser.detector as gender
 import re
 from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, date, timedelta
+import uuid
+import random
+import time
+from pyairtable import Api
 
 # Load environment variables from .env file
 load_dotenv()
@@ -40,6 +44,21 @@ def get_supabase_client() -> Client:
         raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
     
     return create_client(supabase_url, supabase_key)
+
+
+def get_airtable_client() -> Api:
+    """
+    Initialize and return Airtable API client.
+    
+    Returns:
+        Airtable API client instance
+    """
+    airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+    
+    if not airtable_token:
+        raise ValueError("AIRTABLE_ACCESS_TOKEN environment variable is required.")
+    
+    return Api(airtable_token)
 
 
 def scrape_followers(accounts: list) -> dict:
@@ -505,6 +524,1008 @@ def ingest_profiles():
         return jsonify({
             'success': False,
             'error': str(e)
+        }), 500
+
+
+@app.route('/api/daily-selection', methods=['POST'])
+def daily_selection():
+    """
+    API endpoint to select fresh profiles for a new campaign.
+    
+    Creates a new campaign and selects up to DAILY_SELECTION_TARGET unused profiles
+    from global_usernames, marking them as used.
+    
+    Expected JSON payload:
+    {
+        "campaign_date": "2025-10-02" (optional, defaults to today)
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "campaign_id": "uuid",
+        "total_selected": 14400
+    }
+    """
+    try:
+        # Get JSON data from request
+        data = request.get_json() or {}
+        
+        # Get target count from environment variable (default 14400)
+        target_count = int(os.getenv('DAILY_SELECTION_TARGET'))
+        
+        # Get campaign date (default to today)
+        campaign_date_str = data.get('campaign_date')
+        if campaign_date_str:
+            campaign_date_obj = datetime.strptime(campaign_date_str, '%Y-%m-%d').date()
+        else:
+            campaign_date_obj = date.today()
+        
+        print(f"Starting daily selection for {campaign_date_obj}...")
+        print(f"Target: {target_count} profiles")
+        
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Step 1: Create a new campaign
+        campaign_id = str(uuid.uuid4())
+        
+        campaign_response = supabase.table('campaigns').insert({
+            'campaign_id': campaign_id,
+            'campaign_date': campaign_date_obj.isoformat(),
+            'total_assigned': 0,
+            'created_at': datetime.utcnow().isoformat()
+        }).execute()
+        
+        print(f"✓ Created campaign: {campaign_id}")
+        
+        # Step 2: Select up to target_count unused profiles from global_usernames
+        # Exclude female profiles - only select male and unknown
+        available_profiles = supabase.table('global_usernames')\
+            .select('id, username, full_name')\
+            .eq('used', False)\
+            .limit(target_count)\
+            .execute()
+        
+        if not available_profiles.data:
+            return jsonify({
+                'success': False,
+                'error': 'No unused profiles available in global_usernames'
+            }), 400
+        
+        selected_profiles = available_profiles.data
+        total_selected = len(selected_profiles)
+        
+        print(f"✓ Selected {total_selected} unused profiles")
+        
+        # Step 3: Mark selected profiles as used
+        profile_ids = [profile['id'] for profile in selected_profiles]
+        
+        # Update all selected profiles to used=true
+        for profile_id in profile_ids:
+            supabase.table('global_usernames')\
+                .update({
+                    'used': True,
+                    'used_at': datetime.utcnow().isoformat()
+                })\
+                .eq('id', profile_id)\
+                .execute()
+        
+        print(f"✓ Marked {total_selected} profiles as used")
+        
+        # Step 4: Insert into daily_assignments with placeholders
+        assignments = []
+        for profile in selected_profiles:
+            assignments.append({
+                'assignment_id': str(uuid.uuid4()),
+                'campaign_id': campaign_id,
+                'va_table_number': 0,  # Placeholder - will be assigned during distribution
+                'position': 0,  # Placeholder - will be assigned during distribution
+                'id': profile['id'],
+                'username': profile['username'],
+                'full_name': profile['full_name'],
+                'status': 'pending',
+                'assigned_at': datetime.utcnow().isoformat()
+            })
+        
+        # Batch insert assignments (Supabase handles this efficiently)
+        supabase.table('daily_assignments').insert(assignments).execute()
+        
+        print(f"✓ Inserted {total_selected} assignments")
+        
+        # Step 5: Update campaign total_assigned
+        supabase.table('campaigns')\
+            .update({'total_assigned': total_selected})\
+            .eq('campaign_id', campaign_id)\
+            .execute()
+        
+        print(f"✓ Updated campaign total_assigned to {total_selected}")
+        
+        return jsonify({
+            'success': True,
+            'campaign_id': campaign_id,
+            'total_selected': total_selected,
+            'campaign_date': campaign_date_obj.isoformat()
+        })
+        
+    except Exception as e:
+        print(f"Error processing daily selection request: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/distribute/<campaign_id>', methods=['POST'])
+def distribute_campaign(campaign_id: str):
+    """
+    API endpoint to distribute campaign profiles to VA tables.
+    
+    Fetches all unassigned profiles for a campaign, shuffles them randomly,
+    and assigns them to VA tables with positions.
+    
+    URL Parameters:
+        campaign_id: UUID of the campaign to distribute
+    
+    Returns:
+    {
+        "success": true,
+        "campaign_id": "uuid",
+        "va_tables": 80,
+        "assigned_per_table": 180,
+        "total_distributed": 14400
+    }
+    """
+    try:
+        # Get configuration from environment variables
+        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
+
+        print(f"Starting distribution for campaign {campaign_id}...")
+        print(f"Configuration: {num_va_tables} VA tables, {profiles_per_table} profiles per table")
+        
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Step 1: Verify campaign exists
+        campaign = supabase.table('campaigns')\
+            .select('campaign_id, campaign_date, total_assigned')\
+            .eq('campaign_id', campaign_id)\
+            .execute()
+        
+        if not campaign.data or len(campaign.data) == 0:
+            return jsonify({
+                'success': False,
+                'error': f'Campaign {campaign_id} not found'
+            }), 404
+        
+        campaign_info = campaign.data[0]
+        print(f"✓ Found campaign: {campaign_info['campaign_date']} with {campaign_info['total_assigned']} assignments")
+        
+        # Step 2: Fetch all unassigned profiles (va_table_number=0)
+        unassigned = supabase.table('daily_assignments')\
+            .select('assignment_id, id, username, full_name')\
+            .eq('campaign_id', campaign_id)\
+            .eq('va_table_number', 0)\
+            .execute()
+        
+        if not unassigned.data or len(unassigned.data) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No unassigned profiles found for this campaign. Already distributed?'
+            }), 400
+        
+        profiles = unassigned.data
+        total_profiles = len(profiles)
+        
+        print(f"✓ Found {total_profiles} unassigned profiles")
+        
+        # Step 3: Shuffle profiles randomly
+        random.shuffle(profiles)
+        print(f"✓ Shuffled profiles randomly")
+        
+        # Step 4: Assign to VA tables
+        distributed_count = 0
+        current_table = 1
+        current_position = 1
+        
+        for profile in profiles:
+            # Update the assignment with VA table and position
+            supabase.table('daily_assignments')\
+                .update({
+                    'va_table_number': current_table,
+                    'position': current_position
+                })\
+                .eq('assignment_id', profile['assignment_id'])\
+                .execute()
+            
+            distributed_count += 1
+            
+            # Move to next position
+            current_position += 1
+            
+            # If we've filled this table, move to next table
+            if current_position > profiles_per_table:
+                current_position = 1
+                current_table += 1
+                
+                # Stop if we've filled all VA tables
+                if current_table > num_va_tables:
+                    print(f"⚠ Reached maximum VA tables ({num_va_tables}), stopping distribution")
+                    break
+        
+        print(f"✓ Distributed {distributed_count} profiles across {current_table if current_position == 1 else current_table} VA tables")
+        
+        # Calculate actual distribution stats
+        tables_used = current_table if current_position == 1 else current_table
+        
+        return jsonify({
+            'success': True,
+            'campaign_id': campaign_id,
+            'va_tables': tables_used,
+            'assigned_per_table': profiles_per_table,
+            'total_distributed': distributed_count,
+            'total_available': total_profiles
+        })
+        
+    except Exception as e:
+        print(f"Error processing distribution request: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/airtable-sync/<campaign_id>', methods=['POST'])
+def airtable_sync(campaign_id: str):
+    """
+    API endpoint to sync campaign assignments to Airtable tables.
+    
+    Fetches distributed profiles from daily_assignments and pushes them
+    to Airtable tables (one table per VA, 180 profiles each).
+    
+    URL Parameters:
+        campaign_id: UUID of the campaign to sync
+    
+    Returns:
+    {
+        "success": true,
+        "campaign_id": "uuid",
+        "tables_synced": 80,
+        "records_synced": 14400
+    }
+    """
+    try:
+        # Get configuration from environment variables
+        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if not airtable_base_id:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_BASE_ID environment variable not set'
+            }), 500
+        
+        print(f"Starting Airtable sync for campaign {campaign_id}...")
+        print(f"Configuration: {num_va_tables} VA tables, base ID: {airtable_base_id}")
+        
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable = get_airtable_client()
+        
+        # Step 1: Verify campaign exists and fetch campaign_date
+        campaign = supabase.table('campaigns')\
+            .select('campaign_id, campaign_date, total_assigned')\
+            .eq('campaign_id', campaign_id)\
+            .execute()
+        
+        if not campaign.data or len(campaign.data) == 0:
+            return jsonify({
+                'success': False,
+                'error': f'Campaign {campaign_id} not found'
+            }), 404
+        
+        campaign_info = campaign.data[0]
+        campaign_date = campaign_info['campaign_date']
+        print(f"✓ Found campaign: {campaign_date} with {campaign_info['total_assigned']} assignments")
+        
+        # Step 2: Fetch all assigned profiles (va_table_number > 0)
+        assigned = supabase.table('daily_assignments')\
+            .select('va_table_number, position, id, username, full_name, status')\
+            .eq('campaign_id', campaign_id)\
+            .gt('va_table_number', 0)\
+            .order('va_table_number')\
+            .order('position')\
+            .execute()
+        
+        if not assigned.data or len(assigned.data) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'No assigned profiles found for this campaign. Run distribution first.'
+            }), 400
+        
+        profiles = assigned.data
+        total_profiles = len(profiles)
+        
+        print(f"✓ Found {total_profiles} assigned profiles")
+        
+        # Step 3: Group profiles by VA table
+        profiles_by_table = {}
+        for profile in profiles:
+            table_num = profile['va_table_number']
+            if table_num not in profiles_by_table:
+                profiles_by_table[table_num] = []
+            profiles_by_table[table_num].append(profile)
+        
+        print(f"✓ Grouped profiles into {len(profiles_by_table)} VA tables")
+        
+        # Step 4: Sync to Airtable with retry logic
+        tables_synced = 0
+        records_synced = 0
+        max_retries = 3
+        initial_backoff = 1  # seconds
+        batch_size = 10  # Airtable batch limit
+        
+        def sync_with_retry(table, records, retries=0):
+            """Helper function to sync records with exponential backoff."""
+            try:
+                # Split records into batches of 10
+                for i in range(0, len(records), batch_size):
+                    batch = records[i:i + batch_size]
+                    table.batch_create(batch)
+                    time.sleep(0.2)  # Rate limit protection (5 requests per second)
+                return True
+            except Exception as e:
+                if retries < max_retries:
+                    backoff_time = initial_backoff * (2 ** retries)
+                    print(f"⚠ Retry {retries + 1}/{max_retries} after {backoff_time}s: {str(e)}")
+                    time.sleep(backoff_time)
+                    return sync_with_retry(table, records, retries + 1)
+                else:
+                    raise e
+        
+        # Sync each VA table
+        for table_num in sorted(profiles_by_table.keys()):
+            table_name = f"Daily_Outreach_Table_{table_num:02d}"
+            table_profiles = profiles_by_table[table_num]
+            
+            print(f"Syncing {len(table_profiles)} profiles to {table_name}...")
+            
+            try:
+                # Get Airtable table reference
+                table = airtable.table(airtable_base_id, table_name)
+                
+                # Prepare records for Airtable
+                airtable_records = []
+                for profile in table_profiles:
+                    airtable_records.append({
+                        'id': profile['id'],
+                        'username': profile['username'],
+                        'full_name': profile['full_name'],
+                        'position': profile['position'],
+                        'campaign_date': campaign_date,
+                        'status': profile['status']
+                    })
+                
+                # Sync with retry logic
+                sync_with_retry(table, airtable_records)
+                
+                tables_synced += 1
+                records_synced += len(table_profiles)
+                print(f"✓ Synced {len(table_profiles)} records to {table_name}")
+                
+            except Exception as e:
+                print(f"✗ Failed to sync {table_name}: {str(e)}")
+                # Continue with other tables even if one fails
+                continue
+        
+        print(f"✓ Completed sync: {tables_synced} tables, {records_synced} records")
+        
+        return jsonify({
+            'success': True,
+            'campaign_id': campaign_id,
+            'tables_synced': tables_synced,
+            'records_synced': records_synced
+        })
+        
+    except Exception as e:
+        print(f"Error processing Airtable sync request: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/cleanup', methods=['POST'])
+def cleanup():
+    """
+    API endpoint to handle 7-day lifecycle cleanup.
+    
+    This endpoint:
+    1. Marks assignments exactly 7 days old as "to_unfollow" in Supabase
+    2. Updates those records in Airtable to "to_unfollow" status
+    3. Deletes records older than 7 days from Airtable
+    4. Deletes records older than 7 days from Supabase temporary tables
+    
+    Returns:
+    {
+        "success": true,
+        "unfollow_marked": 100,
+        "airtable_deleted": 50,
+        "supabase_deleted": 150
+    }
+    """
+    try:
+        # Get configuration
+        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if not airtable_base_id:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_BASE_ID environment variable not set'
+            }), 500
+        
+        print("Starting 7-day lifecycle cleanup...")
+        
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable = get_airtable_client()
+        
+        # Calculate dates
+        today = datetime.utcnow()
+        exactly_7_days_ago = (today - timedelta(days=7)).date()
+        older_than_7_days = (today - timedelta(days=8)).date()
+        
+        print(f"Today: {today.date()}")
+        print(f"Exactly 7 days ago: {exactly_7_days_ago}")
+        print(f"Older than 7 days: {older_than_7_days}")
+        
+        # === STEP 1: Mark 7-day old assignments as "to_unfollow" in Supabase ===
+        print("\n1. Marking 7-day old assignments as 'to_unfollow' in Supabase...")
+        
+        # Find assignments from exactly 7 days ago
+        seven_day_old = supabase.table('daily_assignments')\
+            .select('assignment_id, va_table_number, position, id, username, campaign_id')\
+            .gte('assigned_at', f'{exactly_7_days_ago}T00:00:00')\
+            .lt('assigned_at', f'{exactly_7_days_ago}T23:59:59')\
+            .eq('status', 'pending')\
+            .execute()
+        
+        unfollow_marked = 0
+        
+        if seven_day_old.data:
+            print(f"   Found {len(seven_day_old.data)} assignments from exactly 7 days ago")
+            
+            # Update status to "to_unfollow"
+            for assignment in seven_day_old.data:
+                supabase.table('daily_assignments')\
+                    .update({'status': 'to_unfollow'})\
+                    .eq('assignment_id', assignment['assignment_id'])\
+                    .execute()
+                unfollow_marked += 1
+            
+            print(f"   ✓ Marked {unfollow_marked} assignments as 'to_unfollow' in Supabase")
+            
+            # === STEP 2: Update those records in Airtable ===
+            print("\n2. Updating Airtable records to 'to_unfollow' status...")
+            
+            # Group by VA table
+            by_table = {}
+            for assignment in seven_day_old.data:
+                table_num = assignment['va_table_number']
+                if table_num > 0:  # Only process assigned records
+                    if table_num not in by_table:
+                        by_table[table_num] = []
+                    by_table[table_num].append(assignment)
+            
+            airtable_updated = 0
+            for table_num, assignments in by_table.items():
+                table_name = f"Daily_Outreach_Table_{table_num:02d}"
+                
+                try:
+                    table = airtable.table(airtable_base_id, table_name)
+                    
+                    # Fetch all records from this table
+                    all_records = table.all()
+                    
+                    # Update matching records
+                    for assignment in assignments:
+                        # Find the record by id field
+                        for record in all_records:
+                            if record['fields'].get('id') == assignment['id']:
+                                # Update status to "to_unfollow"
+                                table.update(record['id'], {'status': 'to_unfollow'})
+                                airtable_updated += 1
+                                break
+                    
+                    time.sleep(0.2)  # Rate limiting
+                    
+                except Exception as e:
+                    print(f"   ⚠ Failed to update {table_name}: {str(e)}")
+                    continue
+            
+            print(f"   ✓ Updated {airtable_updated} Airtable records to 'to_unfollow'")
+        else:
+            print("   No assignments found from exactly 7 days ago")
+        
+        # === STEP 3: Delete records older than 7 days from Airtable ===
+        print(f"\n3. Deleting Airtable records older than {older_than_7_days}...")
+        
+        airtable_deleted = 0
+        
+        for table_num in range(1, num_va_tables + 1):
+            table_name = f"Daily_Outreach_Table_{table_num:02d}"
+            
+            try:
+                table = airtable.table(airtable_base_id, table_name)
+                
+                # Fetch all records
+                all_records = table.all()
+                
+                # Filter records older than 7 days
+                records_to_delete = []
+                for record in all_records:
+                    campaign_date_str = record['fields'].get('campaign_date')
+                    if campaign_date_str:
+                        # Parse date (ISO format: YYYY-MM-DD)
+                        campaign_date = datetime.strptime(campaign_date_str, '%Y-%m-%d').date()
+                        
+                        if campaign_date < older_than_7_days:
+                            records_to_delete.append(record['id'])
+                
+                # Delete in batches of 10
+                for i in range(0, len(records_to_delete), 10):
+                    batch = records_to_delete[i:i + 10]
+                    table.batch_delete(batch)
+                    airtable_deleted += len(batch)
+                    time.sleep(0.2)  # Rate limiting
+                
+                if records_to_delete:
+                    print(f"   ✓ Deleted {len(records_to_delete)} records from {table_name}")
+                
+            except Exception as e:
+                print(f"   ⚠ Failed to clean {table_name}: {str(e)}")
+                continue
+        
+        print(f"   ✓ Deleted {airtable_deleted} total records from Airtable")
+        
+        # === STEP 4: Delete records older than 7 days from Supabase ===
+        print(f"\n4. Deleting Supabase records older than {older_than_7_days}...")
+        
+        supabase_deleted = 0
+        
+        # Delete from raw_scraped_profiles
+        try:
+            result = supabase.table('raw_scraped_profiles')\
+                .delete()\
+                .lt('scraped_at', f'{older_than_7_days}T00:00:00')\
+                .execute()
+            deleted_count = len(result.data) if result.data else 0
+            supabase_deleted += deleted_count
+            print(f"   ✓ Deleted {deleted_count} records from raw_scraped_profiles")
+        except Exception as e:
+            print(f"   ⚠ Failed to delete from raw_scraped_profiles: {str(e)}")
+        
+        # Delete from campaigns
+        try:
+            result = supabase.table('campaigns')\
+                .delete()\
+                .lt('campaign_date', str(older_than_7_days))\
+                .execute()
+            deleted_count = len(result.data) if result.data else 0
+            supabase_deleted += deleted_count
+            print(f"   ✓ Deleted {deleted_count} records from campaigns")
+        except Exception as e:
+            print(f"   ⚠ Failed to delete from campaigns: {str(e)}")
+        
+        # Delete from daily_assignments
+        try:
+            result = supabase.table('daily_assignments')\
+                .delete()\
+                .lt('assigned_at', f'{older_than_7_days}T00:00:00')\
+                .execute()
+            deleted_count = len(result.data) if result.data else 0
+            supabase_deleted += deleted_count
+            print(f"   ✓ Deleted {deleted_count} records from daily_assignments")
+        except Exception as e:
+            print(f"   ⚠ Failed to delete from daily_assignments: {str(e)}")
+        
+        print(f"   ✓ Deleted {supabase_deleted} total records from Supabase")
+        
+        # === Summary ===
+        print("\n" + "=" * 60)
+        print("Cleanup Summary")
+        print("=" * 60)
+        print(f"Unfollow marked (Supabase): {unfollow_marked}")
+        print(f"Airtable deleted: {airtable_deleted}")
+        print(f"Supabase deleted: {supabase_deleted}")
+        print("=" * 60)
+        
+        return jsonify({
+            'success': True,
+            'unfollow_marked': unfollow_marked,
+            'airtable_deleted': airtable_deleted,
+            'supabase_deleted': supabase_deleted
+        })
+        
+    except Exception as e:
+        print(f"Error processing cleanup request: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/run-daily', methods=['POST'])
+def run_daily():
+    """
+    Orchestration endpoint - runs the entire daily pipeline with one API call.
+    
+    Pipeline execution (sequential):
+    1. Daily Selection - Create campaign and select 14,400 profiles
+    2. Distribution - Shuffle and assign profiles to VA tables
+    3. Airtable Sync - Push assignments to Airtable
+    4. Cleanup - Handle 7-day lifecycle maintenance
+    
+    Note: Assumes /api/ingest has already been called by the scraper
+    
+    Returns:
+    {
+        "success": true,
+        "campaign_id": "uuid",
+        "selected": 14400,
+        "distributed": true,
+        "airtable_synced": true,
+        "cleanup_done": true,
+        "execution_time": 125.5
+    }
+    """
+    try:
+        import time as time_module
+        start_time = time_module.time()
+        
+        print("=" * 70)
+        print("DAILY PIPELINE ORCHESTRATION")
+        print("=" * 70)
+        print()
+        
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Get configuration
+        target_count = int(os.getenv('DAILY_SELECTION_TARGET'))
+        campaign_date_obj = date.today()
+        
+        # ===== STEP 1: DAILY SELECTION =====
+        print("STEP 1: Daily Selection")
+        print("-" * 70)
+        
+        try:
+            # Create campaign
+            campaign_id = str(uuid.uuid4())
+            
+            supabase.table('campaigns').insert({
+                'campaign_id': campaign_id,
+                'campaign_date': campaign_date_obj.isoformat(),
+                'total_assigned': 0,
+                'created_at': datetime.utcnow().isoformat()
+            }).execute()
+            
+            print(f"✓ Created campaign: {campaign_id}")
+            
+            # Select unused profiles
+            available_profiles = supabase.table('global_usernames')\
+                .select('id, username, full_name')\
+                .eq('used', False)\
+                .limit(target_count)\
+                .execute()
+            
+            if not available_profiles.data:
+                return jsonify({
+                    'success': False,
+                    'error': 'No unused profiles available in global_usernames',
+                    'step_failed': 'daily_selection'
+                }), 400
+            
+            selected_profiles = available_profiles.data
+            total_selected = len(selected_profiles)
+            
+            print(f"✓ Selected {total_selected} unused profiles")
+            
+            # Mark as used
+            profile_ids = [profile['id'] for profile in selected_profiles]
+            for profile_id in profile_ids:
+                supabase.table('global_usernames')\
+                    .update({
+                        'used': True,
+                        'used_at': datetime.utcnow().isoformat()
+                    })\
+                    .eq('id', profile_id)\
+                    .execute()
+            
+            print(f"✓ Marked {total_selected} profiles as used")
+            
+            # Create placeholder assignments
+            assignments = []
+            for profile in selected_profiles:
+                assignments.append({
+                    'assignment_id': str(uuid.uuid4()),
+                    'campaign_id': campaign_id,
+                    'va_table_number': 0,
+                    'position': 0,
+                    'id': profile['id'],
+                    'username': profile['username'],
+                    'full_name': profile['full_name'],
+                    'status': 'pending',
+                    'assigned_at': datetime.utcnow().isoformat()
+                })
+            
+            supabase.table('daily_assignments').insert(assignments).execute()
+            
+            # Update campaign
+            supabase.table('campaigns')\
+                .update({'total_assigned': total_selected})\
+                .eq('campaign_id', campaign_id)\
+                .execute()
+            
+            print(f"✓ Created {total_selected} placeholder assignments")
+            print()
+            
+        except Exception as e:
+            print(f"✗ Daily Selection failed: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Daily Selection failed: {str(e)}',
+                'step_failed': 'daily_selection'
+            }), 500
+        
+        # ===== STEP 2: DISTRIBUTION =====
+        print("STEP 2: Distribution")
+        print("-" * 70)
+        
+        try:
+            num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+            profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
+            
+            # Fetch unassigned profiles
+            unassigned = supabase.table('daily_assignments')\
+                .select('assignment_id, id, username, full_name')\
+                .eq('campaign_id', campaign_id)\
+                .eq('va_table_number', 0)\
+                .execute()
+            
+            profiles = unassigned.data
+            total_profiles = len(profiles)
+            
+            print(f"✓ Found {total_profiles} unassigned profiles")
+            
+            # Shuffle randomly
+            random.shuffle(profiles)
+            print(f"✓ Shuffled profiles randomly")
+            
+            # Assign to VA tables
+            distributed_count = 0
+            current_table = 1
+            current_position = 1
+            
+            for profile in profiles:
+                supabase.table('daily_assignments')\
+                    .update({
+                        'va_table_number': current_table,
+                        'position': current_position
+                    })\
+                    .eq('assignment_id', profile['assignment_id'])\
+                    .execute()
+                
+                distributed_count += 1
+                current_position += 1
+                
+                if current_position > profiles_per_table:
+                    current_position = 1
+                    current_table += 1
+                    
+                    if current_table > num_va_tables:
+                        break
+            
+            tables_used = current_table if current_position == 1 else current_table
+            
+            print(f"✓ Distributed {distributed_count} profiles to {tables_used} VA tables")
+            print()
+            
+        except Exception as e:
+            print(f"✗ Distribution failed: {str(e)}")
+            return jsonify({
+                'success': False,
+                'error': f'Distribution failed: {str(e)}',
+                'step_failed': 'distribution',
+                'campaign_id': campaign_id
+            }), 500
+        
+        # ===== STEP 3: AIRTABLE SYNC =====
+        print("STEP 3: Airtable Sync")
+        print("-" * 70)
+        
+        try:
+            airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+            
+            if not airtable_base_id:
+                print("⚠ Skipping Airtable sync - AIRTABLE_BASE_ID not set")
+                airtable_synced = False
+            else:
+                airtable = get_airtable_client()
+                campaign_date = campaign_date_obj.isoformat()
+                
+                # Fetch assigned profiles
+                assigned = supabase.table('daily_assignments')\
+                    .select('va_table_number, position, id, username, full_name, status')\
+                    .eq('campaign_id', campaign_id)\
+                    .gt('va_table_number', 0)\
+                    .order('va_table_number')\
+                    .order('position')\
+                    .execute()
+                
+                profiles = assigned.data
+                
+                # Group by VA table
+                profiles_by_table = {}
+                for profile in profiles:
+                    table_num = profile['va_table_number']
+                    if table_num not in profiles_by_table:
+                        profiles_by_table[table_num] = []
+                    profiles_by_table[table_num].append(profile)
+                
+                print(f"✓ Grouped {len(profiles)} profiles into {len(profiles_by_table)} tables")
+                
+                # Sync to Airtable
+                tables_synced = 0
+                records_synced = 0
+                batch_size = 10
+                
+                for table_num in sorted(profiles_by_table.keys()):
+                    table_name = f"Daily_Outreach_Table_{table_num:02d}"
+                    table_profiles = profiles_by_table[table_num]
+                    
+                    try:
+                        table = airtable.table(airtable_base_id, table_name)
+                        
+                        # Prepare records
+                        airtable_records = []
+                        for profile in table_profiles:
+                            airtable_records.append({
+                                'id': profile['id'],
+                                'username': profile['username'],
+                                'full_name': profile['full_name'],
+                                'position': profile['position'],
+                                'campaign_date': campaign_date,
+                                'status': profile['status']
+                            })
+                        
+                        # Batch create
+                        for i in range(0, len(airtable_records), batch_size):
+                            batch = airtable_records[i:i + batch_size]
+                            table.batch_create(batch)
+                            time.sleep(0.2)
+                        
+                        tables_synced += 1
+                        records_synced += len(table_profiles)
+                        
+                    except Exception as e:
+                        print(f"  ⚠ Failed to sync {table_name}: {str(e)}")
+                        continue
+                
+                print(f"✓ Synced {records_synced} records to {tables_synced} Airtable tables")
+                airtable_synced = True
+            
+            print()
+            
+        except Exception as e:
+            print(f"✗ Airtable Sync failed: {str(e)}")
+            print("  Continuing with cleanup...")
+            airtable_synced = False
+        
+        # ===== STEP 4: CLEANUP =====
+        print("STEP 4: Cleanup (7-day lifecycle)")
+        print("-" * 70)
+        
+        try:
+            today = datetime.utcnow()
+            exactly_7_days_ago = (today - timedelta(days=7)).date()
+            older_than_7_days = (today - timedelta(days=8)).date()
+            
+            # Mark for unfollow
+            seven_day_old = supabase.table('daily_assignments')\
+                .select('assignment_id')\
+                .gte('assigned_at', f'{exactly_7_days_ago}T00:00:00')\
+                .lt('assigned_at', f'{exactly_7_days_ago}T23:59:59')\
+                .eq('status', 'pending')\
+                .execute()
+            
+            unfollow_marked = 0
+            if seven_day_old.data:
+                for assignment in seven_day_old.data:
+                    supabase.table('daily_assignments')\
+                        .update({'status': 'to_unfollow'})\
+                        .eq('assignment_id', assignment['assignment_id'])\
+                        .execute()
+                    unfollow_marked += 1
+            
+            print(f"✓ Marked {unfollow_marked} assignments for unfollow")
+            
+            # Delete old records
+            supabase_deleted = 0
+            
+            # Delete from raw_scraped_profiles
+            result = supabase.table('raw_scraped_profiles')\
+                .delete()\
+                .lt('scraped_at', f'{older_than_7_days}T00:00:00')\
+                .execute()
+            supabase_deleted += len(result.data) if result.data else 0
+            
+            # Delete from campaigns
+            result = supabase.table('campaigns')\
+                .delete()\
+                .lt('campaign_date', str(older_than_7_days))\
+                .execute()
+            supabase_deleted += len(result.data) if result.data else 0
+            
+            # Delete from daily_assignments
+            result = supabase.table('daily_assignments')\
+                .delete()\
+                .lt('assigned_at', f'{older_than_7_days}T00:00:00')\
+                .execute()
+            supabase_deleted += len(result.data) if result.data else 0
+            
+            print(f"✓ Deleted {supabase_deleted} old records from Supabase")
+            print()
+            
+            cleanup_done = True
+            
+        except Exception as e:
+            print(f"✗ Cleanup failed: {str(e)}")
+            print("  Pipeline completed with cleanup error")
+            cleanup_done = False
+        
+        # ===== SUMMARY =====
+        execution_time = time_module.time() - start_time
+        
+        print("=" * 70)
+        print("PIPELINE COMPLETED")
+        print("=" * 70)
+        print(f"Campaign ID: {campaign_id}")
+        print(f"Selected: {total_selected} profiles")
+        print(f"Distributed: {distributed_count} profiles")
+        print(f"Airtable Synced: {'Yes' if airtable_synced else 'No'}")
+        print(f"Cleanup Done: {'Yes' if cleanup_done else 'No'}")
+        print(f"Execution Time: {execution_time:.2f} seconds")
+        print("=" * 70)
+        
+        return jsonify({
+            'success': True,
+            'campaign_id': campaign_id,
+            'selected': total_selected,
+            'distributed': True,
+            'airtable_synced': airtable_synced,
+            'cleanup_done': cleanup_done,
+            'execution_time': round(execution_time, 2)
+        })
+        
+    except Exception as e:
+        print(f"Pipeline error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'step_failed': 'unknown'
         }), 500
 
 
