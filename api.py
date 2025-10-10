@@ -61,12 +61,13 @@ def get_airtable_client() -> Api:
     return Api(airtable_token)
 
 
-def scrape_followers(accounts: list) -> dict:
+def scrape_followers(accounts: list, max_count: int = 5) -> dict:
     """
     Handles API requests and Instagram scraping logic.
     
     Args:
         accounts: A list of Instagram account usernames to scrape followers from.
+        max_count: Maximum followers to scrape per account (default: 5).
         
     Returns:
         A dictionary mapping each account to their extracted followers data.
@@ -82,7 +83,7 @@ def scrape_followers(accounts: list) -> dict:
     # Prepare the Actor input
     run_input = {
         "usernames": accounts,
-        "max_count": 5,  # Maximum followers to scrape per account
+        "max_count": max_count,  # Use the provided max_count parameter
     }
     
     # Run the Actor and wait for it to finish
@@ -276,23 +277,25 @@ def filter_by_gender(followers_gender: dict, target_gender: str) -> dict:
     return filtered_followers
 
 
-def process_accounts(accounts: list, target_gender: str = "male") -> dict:
+def process_accounts(accounts: list, target_gender: str = "male", max_count_per_account: int = 5) -> dict:
     """
     Orchestrates the entire workflow.
     
     Args:
         accounts: List of Instagram usernames to scrape followers from.
         target_gender: Target gender to filter for ("male" or "female").
+        max_count_per_account: Maximum followers to scrape per account.
         
     Returns:
         Dictionary with filtered followers data and summary statistics.
     """
     print(f"Starting Instagram follower analysis for accounts: {accounts}")
     print(f"Target gender: {target_gender}")
+    print(f"Max count per account: {max_count_per_account}")
     
     # Step 1: Scrape followers from specified accounts
     print("\n1. Scraping followers...")
-    followers = scrape_followers(accounts)
+    followers = scrape_followers(accounts, max_count_per_account)
     print(f"   Scraped {len(followers)} total followers")
     
     # Step 2: Detect gender for all followers
@@ -339,7 +342,8 @@ def scrape_followers_api():
     Expected JSON payload:
     {
         "accounts": ["username1", "username2"],
-        "targetGender": "male" (optional, defaults to "male")
+        "targetGender": "male" (optional, defaults to "male"),
+        "totalScrapeCount": 150 (optional, total accounts to scrape across all usernames)
     }
     
     Returns:
@@ -375,6 +379,7 @@ def scrape_followers_api():
         
         accounts = data['accounts']
         target_gender = data.get('targetGender', 'male')  # Default to male
+        total_scrape_count = data.get('totalScrapeCount', None)  # User-defined total count
         
         if not isinstance(accounts, list) or len(accounts) == 0:
             return jsonify({
@@ -382,8 +387,38 @@ def scrape_followers_api():
                 'error': 'Accounts must be a non-empty list'
             }), 400
         
-        # Process the accounts
-        result = process_accounts(accounts, target_gender)
+        # Compute per-account scrape count
+        if total_scrape_count is not None:
+            if total_scrape_count <= 0:
+                return jsonify({
+                    'success': False,
+                    'error': 'totalScrapeCount must be greater than 0'
+                }), 400
+            
+            # Compute how many accounts to scrape per username
+            per_account_count = int(total_scrape_count / len(accounts))
+            
+            if per_account_count == 0:
+                return jsonify({
+                    'success': False,
+                    'error': f'totalScrapeCount ({total_scrape_count}) is too small for {len(accounts)} accounts. Need at least {len(accounts)} total.'
+                }), 400
+            
+            print(f"Total scrape count: {total_scrape_count}")
+            print(f"Number of accounts: {len(accounts)}")
+            print(f"Per-account count: {per_account_count}")
+        else:
+            # Fallback to default if not provided
+            per_account_count = 5
+            print(f"No totalScrapeCount provided, using default per-account count: {per_account_count}")
+        
+        # Process the accounts with computed per-account count
+        result = process_accounts(accounts, target_gender, per_account_count)
+        
+        return jsonify({
+            'success': True,
+            'data': result
+        })
         
         return jsonify({
             'success': True,
