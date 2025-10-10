@@ -609,6 +609,7 @@ def daily_selection():
             'campaign_id': campaign_id,
             'campaign_date': campaign_date_obj.isoformat(),
             'total_assigned': 0,
+            'status': False,  # Default to False (failed), will update to True (success) after Airtable sync
             'created_at': datetime.utcnow().isoformat()
         }).execute()
         
@@ -960,17 +961,45 @@ def airtable_sync(campaign_id: str):
         
         print(f"✓ Completed sync: {tables_synced} tables, {records_synced} records")
         
+        # Update campaign status based on sync results
+        # Success (True): All 80 VA tables received their profiles
+        # Failed (False): Less than 80 tables were synced
+        campaign_status = True if tables_synced == num_va_tables and records_synced > 0 else False
+        
+        supabase.table('campaigns')\
+            .update({'status': campaign_status})\
+            .eq('campaign_id', campaign_id)\
+            .execute()
+        
+        status_text = 'success' if campaign_status else 'failed'
+        print(f"✓ Updated campaign status to: {status_text} ({campaign_status})")
+        print(f"  - Expected tables: {num_va_tables}, Synced: {tables_synced}")
+        print(f"  - Total records synced: {records_synced}")
+        
         return jsonify({
             'success': True,
             'campaign_id': campaign_id,
             'tables_synced': tables_synced,
-            'records_synced': records_synced
+            'records_synced': records_synced,
+            'campaign_status': campaign_status
         })
         
     except Exception as e:
         print(f"Error processing Airtable sync request: {str(e)}")
         import traceback
         traceback.print_exc()
+        
+        # Mark campaign as failed (False) on exception
+        try:
+            supabase = get_supabase_client()
+            supabase.table('campaigns')\
+                .update({'status': False})\
+                .eq('campaign_id', campaign_id)\
+                .execute()
+            print(f"✓ Updated campaign status to: failed (False) due to error")
+        except Exception as status_error:
+            print(f"⚠ Could not update campaign status: {str(status_error)}")
+        
         return jsonify({
             'success': False,
             'error': str(e)
@@ -1458,6 +1487,16 @@ def run_daily():
                         continue
                 
                 print(f"✓ Synced {records_synced} records to {tables_synced} Airtable tables")
+                
+                # Update campaign status based on sync results
+                campaign_status = True if tables_synced == num_va_tables and records_synced > 0 else False
+                supabase.table('campaigns')\
+                    .update({'status': campaign_status})\
+                    .eq('campaign_id', campaign_id)\
+                    .execute()
+                status_text = 'success' if campaign_status else 'failed'
+                print(f"✓ Updated campaign status to: {status_text} ({campaign_status})")
+                
                 airtable_synced = True
             
             print()
@@ -1465,6 +1504,17 @@ def run_daily():
         except Exception as e:
             print(f"✗ Airtable Sync failed: {str(e)}")
             print("  Continuing with cleanup...")
+            
+            # Mark campaign as failed (False) on exception
+            try:
+                supabase.table('campaigns')\
+                    .update({'status': False})\
+                    .eq('campaign_id', campaign_id)\
+                    .execute()
+                print(f"✓ Updated campaign status to: failed (False) due to error")
+            except Exception as status_error:
+                print(f"⚠ Could not update campaign status: {str(status_error)}")
+            
             airtable_synced = False
         
         # ===== STEP 4: CLEANUP =====
