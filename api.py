@@ -24,6 +24,9 @@ from pyairtable import Api
 # Load environment variables from .env file
 load_dotenv()
 
+# Constants
+DEFAULT_PROFILES_PER_TABLE = 180  # Fallback if client doesn't send value
+
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend communication
@@ -567,12 +570,13 @@ def daily_selection():
     """
     API endpoint to select fresh profiles for a new campaign.
     
-    Creates a new campaign and selects up to (NUM_VA_TABLES * PROFILES_PER_TABLE) unused profiles
+    Creates a new campaign and selects up to (NUM_VA_TABLES * profiles_per_table) unused profiles
     from global_usernames, marking them as used.
     
     Expected JSON payload:
     {
-        "campaign_date": "2025-10-02" (optional, defaults to today)
+        "campaign_date": "2025-10-02" (optional, defaults to today),
+        "profiles_per_table": 180 (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
     }
     
     Returns:
@@ -586,9 +590,24 @@ def daily_selection():
         # Get JSON data from request
         data = request.get_json() or {}
         
-        # Calculate target count: NUM_VA_TABLES * PROFILES_PER_TABLE
+        # Get profiles_per_table from client (should be NEXT_PUBLIC_PROFILES_PER_TABLE)
+        profiles_per_table = data.get('profiles_per_table')
+        
+        if profiles_per_table is not None:
+            profiles_per_table = int(profiles_per_table)
+            # Validate
+            if profiles_per_table <= 0:
+                return jsonify({
+                    'success': False,
+                    'error': 'profiles_per_table must be a positive integer'
+                }), 400
+            print(f"✓ Using profiles_per_table from client: {profiles_per_table}")
+        else:
+            profiles_per_table = DEFAULT_PROFILES_PER_TABLE
+            print(f"⚠️ WARNING: Client did not send profiles_per_table, using fallback: {profiles_per_table}")
+        
+        # Calculate target count: NUM_VA_TABLES * profiles_per_table
         num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
-        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE', 180))
         target_count = num_va_tables * profiles_per_table
         
         # Get campaign date (default to today)
@@ -709,7 +728,7 @@ def distribute_campaign(campaign_id: str):
     
     Optional JSON payload:
     {
-        "profiles_per_table": 180  (optional, defaults to PROFILES_PER_TABLE env variable)
+        "profiles_per_table": 180  (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
     }
     
     Returns:
@@ -725,16 +744,22 @@ def distribute_campaign(campaign_id: str):
         # Get configuration from environment variables
         num_va_tables = int(os.getenv('NUM_VA_TABLES'))
         
-        # Get profiles_per_table from request body (optional) or fall back to env variable
+        # Get profiles_per_table from request body (should be from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
         data = request.get_json() or {}
         profiles_per_table = data.get('profiles_per_table')
         
         if profiles_per_table is not None:
             profiles_per_table = int(profiles_per_table)
-            print(f"Using custom profiles_per_table from request: {profiles_per_table}")
+            # Validate
+            if profiles_per_table <= 0:
+                return jsonify({
+                    'success': False,
+                    'error': 'profiles_per_table must be a positive integer'
+                }), 400
+            print(f"✓ Using profiles_per_table from client: {profiles_per_table}")
         else:
-            profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
-            print(f"Using default profiles_per_table from env: {profiles_per_table}")
+            profiles_per_table = DEFAULT_PROFILES_PER_TABLE
+            print(f"⚠️ WARNING: Client did not send profiles_per_table, using fallback: {profiles_per_table}")
 
         print(f"Starting distribution for campaign {campaign_id}...")
         print(f"Configuration: {num_va_tables} VA tables, {profiles_per_table} profiles per table")
@@ -1666,9 +1691,18 @@ def run_daily():
         # Initialize Supabase client
         supabase = get_supabase_client()
         
-        # Calculate target count: NUM_VA_TABLES * PROFILES_PER_TABLE
+        # Get configuration - profiles_per_table should come from request body
+        # This endpoint is typically for testing/manual runs, so we use DEFAULT if not provided
+        data = request.get_json() or {}
+        profiles_per_table = data.get('profiles_per_table', DEFAULT_PROFILES_PER_TABLE)
+        
+        if profiles_per_table != DEFAULT_PROFILES_PER_TABLE:
+            print(f"✓ Using profiles_per_table from request: {profiles_per_table}")
+        else:
+            print(f"⚠️ WARNING: Using default profiles_per_table: {profiles_per_table}")
+        
+        # Calculate target count: NUM_VA_TABLES * profiles_per_table
         num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
-        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE', 180))
         target_count = num_va_tables * profiles_per_table
         campaign_date_obj = date.today()
         
@@ -1761,7 +1795,7 @@ def run_daily():
         
         try:
             num_va_tables = int(os.getenv('NUM_VA_TABLES'))
-            profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
+            # profiles_per_table already defined at the top from request body
             
             # Fetch unassigned profiles
             unassigned = supabase.table('daily_assignments')\
