@@ -567,7 +567,7 @@ def daily_selection():
     """
     API endpoint to select fresh profiles for a new campaign.
     
-    Creates a new campaign and selects up to DAILY_SELECTION_TARGET unused profiles
+    Creates a new campaign and selects up to (NUM_VA_TABLES * PROFILES_PER_TABLE) unused profiles
     from global_usernames, marking them as used.
     
     Expected JSON payload:
@@ -586,8 +586,10 @@ def daily_selection():
         # Get JSON data from request
         data = request.get_json() or {}
         
-        # Get target count from environment variable (default 14400)
-        target_count = int(os.getenv('DAILY_SELECTION_TARGET'))
+        # Calculate target count: NUM_VA_TABLES * PROFILES_PER_TABLE
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
+        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE', 180))
+        target_count = num_va_tables * profiles_per_table
         
         # Get campaign date (default to today)
         campaign_date_str = data.get('campaign_date')
@@ -705,6 +707,11 @@ def distribute_campaign(campaign_id: str):
     URL Parameters:
         campaign_id: UUID of the campaign to distribute
     
+    Optional JSON payload:
+    {
+        "profiles_per_table": 180  (optional, defaults to PROFILES_PER_TABLE env variable)
+    }
+    
     Returns:
     {
         "success": true,
@@ -717,7 +724,17 @@ def distribute_campaign(campaign_id: str):
     try:
         # Get configuration from environment variables
         num_va_tables = int(os.getenv('NUM_VA_TABLES'))
-        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
+        
+        # Get profiles_per_table from request body (optional) or fall back to env variable
+        data = request.get_json() or {}
+        profiles_per_table = data.get('profiles_per_table')
+        
+        if profiles_per_table is not None:
+            profiles_per_table = int(profiles_per_table)
+            print(f"Using custom profiles_per_table from request: {profiles_per_table}")
+        else:
+            profiles_per_table = int(os.getenv('PROFILES_PER_TABLE'))
+            print(f"Using default profiles_per_table from env: {profiles_per_table}")
 
         print(f"Starting distribution for campaign {campaign_id}...")
         print(f"Configuration: {num_va_tables} VA tables, {profiles_per_table} profiles per table")
@@ -944,7 +961,7 @@ def airtable_sync(campaign_id: str):
                         'full_name': profile['full_name'],
                         'position': profile['position'],
                         'campaign_date': campaign_date,
-                        'status': profile['status']
+                        'progress_status': profile['status']  # Map Supabase 'status' to Airtable 'progress_status'
                     })
                 
                 # Sync with retry logic
@@ -1006,9 +1023,17 @@ def airtable_sync(campaign_id: str):
         }), 500
 
 
+"""
+OLD CLEANUP ENDPOINT - REPLACED BY NEW 4-STATUS WORKFLOW
+This endpoint has been replaced by three new endpoints:
+1. POST /api/sync-airtable-statuses - Sync VA manual updates from Airtable → Supabase
+2. POST /api/mark-unfollow-due - Mark 7-day old 'followed' records as 'unfollow'
+3. POST /api/delete-completed-after-delay - Delete 'completed' records after 24 hours
+
+Kept for reference during transition. Remove after testing new workflow.
+
 @app.route('/api/cleanup', methods=['POST'])
 def cleanup():
-    """
     API endpoint to handle 7-day lifecycle cleanup.
     
     This endpoint:
@@ -1024,7 +1049,6 @@ def cleanup():
         "airtable_deleted": 50,
         "supabase_deleted": 150
     }
-    """
     try:
         # Get configuration
         num_va_tables = int(os.getenv('NUM_VA_TABLES'))
@@ -1227,6 +1251,383 @@ def cleanup():
             'success': False,
             'error': str(e)
         }), 500
+"""
+
+
+@app.route('/api/sync-airtable-statuses', methods=['POST'])
+def sync_airtable_statuses():
+    """
+    Sync manual VA status updates from Airtable to Supabase.
+    
+    This endpoint:
+    1. Fetches all records from all 80 VA tables in Airtable
+    2. Matches records by Instagram 'id' field
+    3. Updates Supabase where status differs
+    4. Idempotent operation - safe to run multiple times
+    
+    Returns:
+    {
+        "success": true,
+        "synced_count": 150,
+        "errors": []
+    }
+    """
+    try:
+        # Get configuration
+        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if not airtable_base_id:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_BASE_ID environment variable not set'
+            }), 500
+        
+        print("Starting Airtable → Supabase status sync...")
+        
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable = get_airtable_client()
+        
+        synced_count = 0
+        errors = []
+        
+        # Process each VA table
+        for table_num in range(1, num_va_tables + 1):
+            table_name = f"Daily_Outreach_Table_{table_num:02d}"
+            
+            try:
+                table = airtable.table(airtable_base_id, table_name)
+                
+                # Fetch all records from Airtable
+                all_records = table.all()
+                
+                # Process in batches
+                for i in range(0, len(all_records), 10):
+                    batch = all_records[i:i + 10]
+                    
+                    for record in batch:
+                        fields = record['fields']
+                        instagram_id = fields.get('id')
+                        airtable_status = fields.get('progress_status')  # Use progress_status field
+                        
+                        if not instagram_id or not airtable_status:
+                            continue
+                        
+                        # Find matching record in Supabase
+                        supabase_record = supabase.table('daily_assignments')\
+                            .select('assignment_id, status')\
+                            .eq('id', instagram_id)\
+                            .eq('va_table_number', table_num)\
+                            .execute()
+                        
+                        if supabase_record.data and len(supabase_record.data) > 0:
+                            current_status = supabase_record.data[0]['status']
+                            
+                            # Update if status differs
+                            if current_status != airtable_status:
+                                supabase.table('daily_assignments')\
+                                    .update({'status': airtable_status})\
+                                    .eq('assignment_id', supabase_record.data[0]['assignment_id'])\
+                                    .execute()
+                                synced_count += 1
+                                print(f"   ✓ Synced {instagram_id}: {current_status} → {airtable_status}")
+                    
+                    time.sleep(0.2)  # Rate limiting
+                
+                print(f"   ✓ Processed {table_name}")
+                
+            except Exception as e:
+                error_msg = f"Failed to sync {table_name}: {str(e)}"
+                print(f"   ⚠ {error_msg}")
+                errors.append(error_msg)
+                continue
+        
+        print(f"\n✓ Sync complete! Synced {synced_count} records")
+        
+        return jsonify({
+            'success': True,
+            'synced_count': synced_count,
+            'errors': errors
+        })
+        
+    except Exception as e:
+        print(f"Error syncing Airtable statuses: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/mark-unfollow-due', methods=['POST'])
+def mark_unfollow_due():
+    """
+    Mark followed records 7+ days old as 'unfollow'.
+    
+    This endpoint:
+    1. Queries daily_assignments WHERE status='followed' AND assigned_at <= NOW() - INTERVAL '7 days'
+    2. Updates status to 'unfollow' in Supabase
+    3. Updates matching records in Airtable
+    4. Batch processes with retry logic
+    
+    Returns:
+    {
+        "success": true,
+        "marked_count": 50,
+        "errors": []
+    }
+    """
+    try:
+        # Get configuration
+        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if not airtable_base_id:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_BASE_ID environment variable not set'
+            }), 500
+        
+        print("Starting 7-day unfollow marking...")
+        
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable = get_airtable_client()
+        
+        # Calculate 7 days ago
+        seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        
+        print(f"Marking records with assigned_at <= {seven_days_ago}")
+        
+        # Find records that are 7+ days old and still 'followed'
+        followed_records = supabase.table('daily_assignments')\
+            .select('assignment_id, va_table_number, id, username')\
+            .eq('status', 'followed')\
+            .lte('assigned_at', seven_days_ago)\
+            .execute()
+        
+        marked_count = 0
+        errors = []
+        
+        if not followed_records.data:
+            print("No records to mark for unfollow")
+            return jsonify({
+                'success': True,
+                'marked_count': 0,
+                'errors': []
+            })
+        
+        print(f"Found {len(followed_records.data)} records to mark as 'unfollow'")
+        
+        # Update Supabase first
+        for record in followed_records.data:
+            try:
+                supabase.table('daily_assignments')\
+                    .update({'status': 'unfollow'})\
+                    .eq('assignment_id', record['assignment_id'])\
+                    .execute()
+                marked_count += 1
+            except Exception as e:
+                error_msg = f"Failed to update Supabase record {record['assignment_id']}: {str(e)}"
+                print(f"   ⚠ {error_msg}")
+                errors.append(error_msg)
+        
+        print(f"   ✓ Updated {marked_count} records in Supabase")
+        
+        # Group by VA table for Airtable updates
+        by_table = {}
+        for record in followed_records.data:
+            table_num = record['va_table_number']
+            if table_num > 0:  # Only process assigned records
+                if table_num not in by_table:
+                    by_table[table_num] = []
+                by_table[table_num].append(record)
+        
+        # Update Airtable
+        airtable_updated = 0
+        for table_num, assignments in by_table.items():
+            table_name = f"Daily_Outreach_Table_{table_num:02d}"
+            
+            try:
+                table = airtable.table(airtable_base_id, table_name)
+                
+                # Fetch all records from this table
+                all_records = table.all()
+                
+                # Update matching records
+                for assignment in assignments:
+                    # Find the record by id field
+                    for airtable_record in all_records:
+                        if airtable_record['fields'].get('id') == assignment['id']:
+                            # Update progress_status to "unfollow"
+                            table.update(airtable_record['id'], {'progress_status': 'unfollow'})
+                            airtable_updated += 1
+                            break
+                
+                time.sleep(0.2)  # Rate limiting
+                print(f"   ✓ Updated {table_name}")
+                
+            except Exception as e:
+                error_msg = f"Failed to update {table_name}: {str(e)}"
+                print(f"   ⚠ {error_msg}")
+                errors.append(error_msg)
+                continue
+        
+        print(f"   ✓ Updated {airtable_updated} records in Airtable")
+        
+        return jsonify({
+            'success': True,
+            'marked_count': marked_count,
+            'airtable_updated': airtable_updated,
+            'errors': errors
+        })
+        
+    except Exception as e:
+        print(f"Error marking unfollow due: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/delete-completed-after-delay', methods=['POST'])
+def delete_completed_after_delay():
+    """
+    Delete completed records after 24 hours.
+    
+    This endpoint:
+    1. Queries WHERE status='completed' AND updated_at <= NOW() - INTERVAL '24 hours'
+    2. Deletes from Airtable first (batch delete)
+    3. Deletes from Supabase daily_assignments
+    4. Never touches global_usernames or source_profiles
+    
+    Returns:
+    {
+        "success": true,
+        "deleted_count": 30,
+        "errors": []
+    }
+    """
+    try:
+        # Get configuration
+        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        
+        if not airtable_base_id:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_BASE_ID environment variable not set'
+            }), 500
+        
+        print("Starting 24-hour completed record deletion...")
+        
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable = get_airtable_client()
+        
+        # Calculate 24 hours ago
+        twenty_four_hours_ago = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        
+        print(f"Deleting records with status='completed' AND updated_at <= {twenty_four_hours_ago}")
+        
+        # Find completed records older than 24 hours
+        completed_records = supabase.table('daily_assignments')\
+            .select('assignment_id, va_table_number, id, username')\
+            .eq('status', 'completed')\
+            .lte('updated_at', twenty_four_hours_ago)\
+            .execute()
+        
+        if not completed_records.data:
+            print("No completed records to delete")
+            return jsonify({
+                'success': True,
+                'deleted_count': 0,
+                'errors': []
+            })
+        
+        print(f"Found {len(completed_records.data)} completed records to delete")
+        
+        errors = []
+        
+        # Group by VA table for Airtable deletion
+        by_table = {}
+        for record in completed_records.data:
+            table_num = record['va_table_number']
+            if table_num > 0:  # Only process assigned records
+                if table_num not in by_table:
+                    by_table[table_num] = []
+                by_table[table_num].append(record)
+        
+        # Delete from Airtable first
+        airtable_deleted = 0
+        for table_num, assignments in by_table.items():
+            table_name = f"Daily_Outreach_Table_{table_num:02d}"
+            
+            try:
+                table = airtable.table(airtable_base_id, table_name)
+                
+                # Fetch all records from this table
+                all_records = table.all()
+                
+                # Find matching records to delete
+                records_to_delete = []
+                for assignment in assignments:
+                    for airtable_record in all_records:
+                        if airtable_record['fields'].get('id') == assignment['id']:
+                            records_to_delete.append(airtable_record['id'])
+                            break
+                
+                # Delete in batches of 10
+                for i in range(0, len(records_to_delete), 10):
+                    batch = records_to_delete[i:i + 10]
+                    table.batch_delete(batch)
+                    airtable_deleted += len(batch)
+                    time.sleep(0.2)  # Rate limiting
+                
+                if records_to_delete:
+                    print(f"   ✓ Deleted {len(records_to_delete)} records from {table_name}")
+                
+            except Exception as e:
+                error_msg = f"Failed to delete from {table_name}: {str(e)}"
+                print(f"   ⚠ {error_msg}")
+                errors.append(error_msg)
+                continue
+        
+        print(f"   ✓ Deleted {airtable_deleted} records from Airtable")
+        
+        # Delete from Supabase daily_assignments
+        supabase_deleted = 0
+        for record in completed_records.data:
+            try:
+                supabase.table('daily_assignments')\
+                    .delete()\
+                    .eq('assignment_id', record['assignment_id'])\
+                    .execute()
+                supabase_deleted += 1
+            except Exception as e:
+                error_msg = f"Failed to delete Supabase record {record['assignment_id']}: {str(e)}"
+                print(f"   ⚠ {error_msg}")
+                errors.append(error_msg)
+        
+        print(f"   ✓ Deleted {supabase_deleted} records from Supabase")
+        
+        return jsonify({
+            'success': True,
+            'deleted_count': supabase_deleted,
+            'airtable_deleted': airtable_deleted,
+            'errors': errors
+        })
+        
+    except Exception as e:
+        print(f"Error deleting completed records: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/run-daily', methods=['POST'])
@@ -1265,8 +1666,10 @@ def run_daily():
         # Initialize Supabase client
         supabase = get_supabase_client()
         
-        # Get configuration
-        target_count = int(os.getenv('DAILY_SELECTION_TARGET'))
+        # Calculate target count: NUM_VA_TABLES * PROFILES_PER_TABLE
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
+        profiles_per_table = int(os.getenv('PROFILES_PER_TABLE', 180))
+        target_count = num_va_tables * profiles_per_table
         campaign_date_obj = date.today()
         
         # ===== STEP 1: DAILY SELECTION =====
@@ -1470,7 +1873,7 @@ def run_daily():
                                 'full_name': profile['full_name'],
                                 'position': profile['position'],
                                 'campaign_date': campaign_date,
-                                'status': profile['status']
+                                'progress_status': profile['status']  # Map Supabase 'status' to Airtable 'progress_status'
                             })
                         
                         # Batch create
