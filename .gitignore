@@ -2,7 +2,6 @@
 .env
 .env.local
 .env.production
-app.py
 
 # Python
 __pycache__/
