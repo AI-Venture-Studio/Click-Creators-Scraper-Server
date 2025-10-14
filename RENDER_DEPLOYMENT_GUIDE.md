@@ -28,15 +28,17 @@
 Render will automatically detect `render.yaml` and create:
 - ✅ **Redis service** (`aivs-redis`) - Free tier
 - ✅ **Web service** (`aivs-instagram-scraper-api`) - Free tier
-- ✅ **Worker service** (`aivs-celery-worker`) - Free tier
+  - Runs both Flask API and Celery worker in the same container
+
+**Note:** To stay within Render's free tier (1 free web service per account), we run the Celery worker alongside the Flask app in the same service.
 
 ### Step 3: Configure Environment Variables
 
 After the services are created, you need to manually set environment variables:
 
-#### For BOTH Web Service AND Worker Service:
+#### For the Web Service:
 
-1. Go to each service in Render dashboard
+1. Go to the web service in Render dashboard
 2. Click **"Environment"** tab
 3. Add these environment variables:
 
@@ -63,14 +65,14 @@ SENTRY_DSN=<your-sentry-dsn-if-you-have-one>
 ```
 
 4. **Click "Save Changes"**
-5. Services will automatically redeploy with new environment variables
+5. Service will automatically redeploy with new environment variables
 
 ### Step 4: Wait for Deployment
 
 Monitor the deployment logs:
 - **Redis**: Should be ready in ~30 seconds
 - **Web Service**: Should build and deploy in ~2-3 minutes
-- **Worker Service**: Should build and deploy in ~2-3 minutes
+  - This service runs both Flask API and Celery worker
 
 ### Step 5: Verify Deployment
 
@@ -96,9 +98,9 @@ curl -X POST https://aivs-instagram-scraper-api.onrender.com/api/scrape-follower
 Should return a JSON response with `job_id` and status URLs.
 
 3. **Check logs**:
-   - Web service logs: Should show Flask requests
-   - Worker service logs: Should show Celery worker ready and processing tasks
-   - Redis logs: Should show connections from web and worker
+   - Web service logs: Should show both Flask requests AND Celery worker messages
+   - Look for: `celery@... ready` to confirm worker is running
+   - Redis logs: Should show connections from the web service
 
 ---
 
@@ -143,13 +145,15 @@ Should return a JSON response with `job_id` and status URLs.
 
 ## 💰 Cost Breakdown
 
-- **Redis (Free)**: 25 MB storage, good for task queue
-- **Web Service (Free)**: Spins down after 15 min inactivity, cold starts ~30s
-- **Worker Service (Free)**: Spins down after 15 min inactivity
+**100% FREE with Render Free Tier:**
+- **Redis (Free)**: 25 MB storage, sufficient for task queue
+- **Web Service (Free)**: 512 MB RAM, runs both Flask API + Celery worker
+  - Spins down after 15 min inactivity
+  - Cold starts take ~30 seconds
 
-**Upgrade to Paid** ($7/month each) for:
-- Always-on services (no cold starts)
-- More memory and CPU
+**Upgrade to Paid** ($7/month) for:
+- Always-on service (no cold starts)
+- 2 GB RAM (better for heavy workloads)
 - Custom domains
 - Priority support
 
@@ -157,10 +161,11 @@ Should return a JSON response with `job_id` and status URLs.
 
 ## 📝 Important Notes
 
-1. **Free tier sleeps**: Services spin down after 15 min of inactivity. First request after sleep takes ~30 seconds.
+1. **Free tier sleeps**: Service spins down after 15 min of inactivity. First request after sleep takes ~30 seconds.
 2. **Database migration**: Already applied locally. Tables exist in Supabase.
-3. **Async jobs**: Background worker handles all Celery tasks automatically.
-4. **Scaling**: Can upgrade individual services to paid plans as needed.
+3. **Combined service**: Flask API and Celery worker run in the same container to stay within free tier limits.
+4. **Async jobs**: Background worker handles all Celery tasks automatically.
+5. **Scaling**: Can upgrade to paid plan for always-on service and better performance.
 
 ---
 
@@ -171,10 +176,9 @@ Should return a JSON response with `job_id` and status URLs.
 - [ ] Render account created and connected to GitHub
 - [ ] Blueprint deployed from render.yaml
 - [ ] Environment variables set in web service
-- [ ] Environment variables set in worker service
 - [ ] Health check endpoint returns "ok"
 - [ ] Async endpoint test successful
-- [ ] Worker logs show Celery ready
+- [ ] Web service logs show both Flask AND Celery worker running
 - [ ] Frontend updated with new API URL
 
 ---

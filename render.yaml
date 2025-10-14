@@ -10,7 +10,7 @@ services:
     maxmemoryPolicy: noeviction
     ipAllowList: [] # Allow all IPs (required for free tier)
 
-  # Web Service (Flask API)
+  # Web Service (Flask API + Celery Worker Combined)
   - type: web
     name: aivs-instagram-scraper-api
     region: oregon
@@ -18,7 +18,7 @@ services:
     plan: free
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn wsgi:app --workers 4 --timeout 120
+    startCommand: bash start_combined.sh
     healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
@@ -51,39 +51,8 @@ services:
       - key: SENTRY_DSN
         sync: false  # Optional: Set if using Sentry
 
-  # Background Worker Service (Celery)
-  - type: worker
-    name: aivs-celery-worker
-    region: oregon
-    runtime: python
-    plan: free
-    branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: celery -A celery_config worker --loglevel=info --concurrency=2
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.7
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: aivs-redis
-          property: connectionString
-      - key: SUPABASE_URL
-        sync: false  # Set manually in Render dashboard
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false  # Set manually in Render dashboard
-      - key: APIFY_API_KEY
-        sync: false  # Set manually in Render dashboard
-      - key: APIFY_ACTOR_ID
-        sync: false  # Set manually in Render dashboard
-      - key: AIRTABLE_ACCESS_TOKEN
-        sync: false  # Set manually in Render dashboard
-      - key: AIRTABLE_BASE_ID
-        sync: false  # Set manually in Render dashboard
-      - key: NUM_VA_TABLES
-        value: 80
-      - key: SENTRY_DSN
-        sync: false  # Optional: Set if using Sentry
-
 # Note: After deploying, you must manually set the environment variables marked with "sync: false"
-# in the Render dashboard for both the web service and worker service.
+# in the Render dashboard.
+#
+# FREE TIER NOTE: Worker service removed - Celery runs alongside Flask in the web service
+# to stay within Render's free tier limits (1 free web service per account)
