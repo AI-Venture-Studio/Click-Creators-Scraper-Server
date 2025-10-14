@@ -15,7 +15,7 @@ import gender_guesser.detector as gender
 import re
 from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
-from datetime import datetime, date, timedelta
+from datetime import datetime, timezone, date, timedelta
 import uuid
 import random
 import time
@@ -514,7 +514,7 @@ def ingest_profiles():
                     'id': profile_id,
                     'username': username,
                     'full_name': full_name,
-                    'scraped_at': datetime.utcnow().isoformat()
+                    'scraped_at': datetime.now(timezone.utc).isoformat()
                 }).execute()
                 inserted_raw += 1
                 print(f"✓ Inserted {username} into raw_scraped_profiles")
@@ -539,7 +539,7 @@ def ingest_profiles():
                         'username': username,
                         'full_name': full_name,
                         'used': False,
-                        'created_at': datetime.utcnow().isoformat()
+                        'created_at': datetime.now(timezone.utc).isoformat()
                     }).execute()
                     added_to_global += 1
                     print(f"✓ Added {username} to global_usernames")
@@ -631,7 +631,7 @@ def daily_selection():
             'campaign_date': campaign_date_obj.isoformat(),
             'total_assigned': 0,
             'status': False,  # Default to False (failed), will update to True (success) after Airtable sync
-            'created_at': datetime.utcnow().isoformat()
+            'created_at': datetime.now(timezone.utc).isoformat()
         }).execute()
         
         print(f"✓ Created campaign: {campaign_id}")
@@ -663,7 +663,7 @@ def daily_selection():
             supabase.table('global_usernames')\
                 .update({
                     'used': True,
-                    'used_at': datetime.utcnow().isoformat()
+                    'used_at': datetime.now(timezone.utc).isoformat()
                 })\
                 .eq('id', profile_id)\
                 .execute()
@@ -682,7 +682,7 @@ def daily_selection():
                 'username': profile['username'],
                 'full_name': profile['full_name'],
                 'status': 'pending',
-                'assigned_at': datetime.utcnow().isoformat()
+                'assigned_at': datetime.now(timezone.utc).isoformat()
             })
         
         # Batch insert assignments (Supabase handles this efficiently)
@@ -1092,7 +1092,7 @@ def cleanup():
         airtable = get_airtable_client()
         
         # Calculate dates
-        today = datetime.utcnow()
+        today = datetime.now(timezone.utc)
         exactly_7_days_ago = (today - timedelta(days=7)).date()
         older_than_7_days = (today - timedelta(days=8)).date()
         
@@ -1421,7 +1421,7 @@ def mark_unfollow_due():
         airtable = get_airtable_client()
         
         # Calculate 7 days ago
-        seven_days_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         
         print(f"Marking records with assigned_at <= {seven_days_ago}")
         
@@ -1553,7 +1553,7 @@ def delete_completed_after_delay():
         airtable = get_airtable_client()
         
         # Calculate 24 hours ago
-        twenty_four_hours_ago = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         
         print(f"Deleting records with status='completed' AND updated_at <= {twenty_four_hours_ago}")
         
@@ -1718,7 +1718,7 @@ def run_daily():
                 'campaign_id': campaign_id,
                 'campaign_date': campaign_date_obj.isoformat(),
                 'total_assigned': 0,
-                'created_at': datetime.utcnow().isoformat()
+                'created_at': datetime.now(timezone.utc).isoformat()
             }).execute()
             
             print(f"✓ Created campaign: {campaign_id}")
@@ -1748,7 +1748,7 @@ def run_daily():
                 supabase.table('global_usernames')\
                     .update({
                         'used': True,
-                        'used_at': datetime.utcnow().isoformat()
+                        'used_at': datetime.now(timezone.utc).isoformat()
                     })\
                     .eq('id', profile_id)\
                     .execute()
@@ -1767,7 +1767,7 @@ def run_daily():
                     'username': profile['username'],
                     'full_name': profile['full_name'],
                     'status': 'pending',
-                    'assigned_at': datetime.utcnow().isoformat()
+                    'assigned_at': datetime.now(timezone.utc).isoformat()
                 })
             
             supabase.table('daily_assignments').insert(assignments).execute()
@@ -1959,7 +1959,7 @@ def run_daily():
         print("-" * 70)
         
         try:
-            today = datetime.utcnow()
+            today = datetime.now(timezone.utc)
             exactly_7_days_ago = (today - timedelta(days=7)).date()
             older_than_7_days = (today - timedelta(days=8)).date()
             
