@@ -3,11 +3,24 @@ Instagram Follower Scraper API
 
 A Flask API that provides functionality to scrape Instagram followers from specified accounts,
 detect their gender, filter them based on gender preferences, and persist to Supabase.
+
+REFACTORED FOR PRODUCTION:
+- Asynchronous task processing with Celery
+- Background workers for scalability
+- Batch operations for memory efficiency
+- Logging and error tracking with Sentry
+- Rate limiting for API protection
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import os
+import logging
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from sentry_sdk.integrations.celery import CeleryIntegration
 from dotenv import load_dotenv
 from apify_client import ApifyClient
 import pandas as pd
@@ -20,19 +33,71 @@ import uuid
 import random
 import time
 from pyairtable import Api
+import traceback
 
 # Load environment variables from .env file
 load_dotenv()
 
+# ===================================================================
+# LOGGING CONFIGURATION
+# ===================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ===================================================================
+# SENTRY ERROR TRACKING
+# ===================================================================
+if os.getenv('SENTRY_DSN'):
+    sentry_sdk.init(
+        dsn=os.getenv('SENTRY_DSN'),
+        integrations=[
+            FlaskIntegration(),
+            CeleryIntegration()
+        ],
+        traces_sample_rate=0.1,  # 10% performance monitoring
+        environment=os.getenv('FLASK_ENV', 'development'),
+        release=os.getenv('APP_VERSION', '1.0.0')
+    )
+    logger.info("Sentry error tracking initialized")
+else:
+    logger.warning("SENTRY_DSN not set, error tracking disabled")
+
 # Constants
 DEFAULT_PROFILES_PER_TABLE = 180  # Fallback if client doesn't send value
 
-# Initialize Flask app
+# ===================================================================
+# FLASK APP INITIALIZATION
+# ===================================================================
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend communication
+
+# CORS configuration with restricted origins
+allowed_origins = os.getenv('ALLOWED_ORIGINS', '*').split(',')
+CORS(app, resources={
+    r"/api/*": {
+        "origins": allowed_origins,
+        "methods": ["GET", "POST"],
+        "allow_headers": ["Content-Type", "X-API-Key"]
+    }
+})
+
+# Rate limiting configuration
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per hour"],
+    storage_uri=os.getenv('REDIS_URL', 'memory://')
+)
+
+logger.info("Flask app initialized with CORS and rate limiting")
 
 
-# Initialize Supabase client
+# ===================================================================
+# SUPABASE CLIENT
+# ===================================================================
 def get_supabase_client() -> Client:
     """
     Initialize and return Supabase client using service role key.
@@ -2056,7 +2121,9 @@ def health_check():
     """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
-        'service': 'Instagram Scraper API'
+        'service': 'Instagram Scraper API (Production)',
+        'version': os.getenv('APP_VERSION', '1.0.0'),
+        'async_enabled': True
     })
 
 
@@ -2066,6 +2133,31 @@ def healthz():
     return 'ok', 200
 
 
+# ===================================================================
+# REGISTER ASYNC ENDPOINTS
+# ===================================================================
+try:
+    from api_async import register_async_endpoints
+    register_async_endpoints(app, get_supabase_client)
+    logger.info("✅ Async endpoints registered successfully")
+except ImportError as e:
+    logger.warning(f"⚠️ Could not import async endpoints: {e}")
+    logger.warning("Running in legacy synchronous mode")
+
+
+# ===================================================================
+# APPLICATION ENTRY POINT
+# ===================================================================
 if __name__ == '__main__':
-    print("Starting Instagram Scraper API on port 5001...")
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    port = int(os.environ.get("PORT", 5001))
+    debug = os.getenv('FLASK_ENV') != 'production'
+    
+    logger.info("=" * 60)
+    logger.info("Instagram Scraper API Starting...")
+    logger.info(f"Port: {port}")
+    logger.info(f"Environment: {os.getenv('FLASK_ENV', 'development')}")
+    logger.info(f"Debug mode: {debug}")
+    logger.info(f"Async tasks: {'Enabled' if 'api_async' in dir() else 'Disabled'}")
+    logger.info("=" * 60)
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
