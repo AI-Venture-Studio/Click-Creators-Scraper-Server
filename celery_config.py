@@ -10,14 +10,27 @@ celery = Celery('instagram_scraper')
 
 # Redis configuration from Heroku or local
 redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+
+# SSL/TLS settings for secure Redis connections
+broker_use_ssl = None
+redis_backend_use_ssl = None
+
 # Heroku Redis URLs use 'redis://' but SSL is required in production
 if redis_url.startswith('redis://') and 'localhost' not in redis_url:
     redis_url = redis_url.replace('redis://', 'rediss://')
+    # Configure SSL for secure Redis (rediss://)
+    import ssl
+    broker_use_ssl = {
+        'ssl_cert_reqs': ssl.CERT_NONE  # Don't verify SSL certificates (Render managed Redis)
+    }
+    redis_backend_use_ssl = broker_use_ssl
 
 # Celery configuration
 celery.conf.update(
     broker_url=redis_url,
     result_backend=redis_url,
+    broker_use_ssl=broker_use_ssl,
+    redis_backend_use_ssl=redis_backend_use_ssl,
     
     # Task settings
     task_serializer='json',

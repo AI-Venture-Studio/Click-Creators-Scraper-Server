@@ -85,11 +85,12 @@ CORS(app, resources={
 })
 
 # Rate limiting configuration
+# Use in-memory storage to avoid SSL issues with Redis for rate limiting
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["200 per hour"],
-    storage_uri=os.getenv('REDIS_URL', 'memory://')
+    storage_uri='memory://'  # Use in-memory storage instead of Redis
 )
 
 logger.info("Flask app initialized with CORS and rate limiting")
@@ -2128,6 +2129,7 @@ def health_check():
 
 
 @app.route('/healthz', methods=['GET'])
+@limiter.exempt  # Exempt health checks from rate limiting
 def healthz():
     """Simple health check endpoint for Electron process management."""
     return 'ok', 200
