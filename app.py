@@ -18,6 +18,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import os
 import logging
+import threading
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 from sentry_sdk.integrations.celery import CeleryIntegration
@@ -97,22 +98,41 @@ logger.info("Flask app initialized with CORS and rate limiting")
 
 
 # ===================================================================
-# SUPABASE CLIENT
+# SUPABASE CLIENT WITH CONNECTION POOLING (THREAD-SAFE)
 # ===================================================================
+# Use singleton pattern with thread lock to prevent race conditions in multi-threaded Flask
+_supabase_client = None
+_supabase_lock = threading.Lock()
+
 def get_supabase_client() -> Client:
     """
     Initialize and return Supabase client using service role key.
     
-    Returns:
-        Supabase client instance
+    OPTIMIZED: Uses thread-safe singleton pattern to reuse the same client instance
+    across all requests, preventing connection leaks and memory bloat.
     """
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+    global _supabase_client
     
-    if not supabase_url or not supabase_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
+    # Double-checked locking pattern for thread safety
+    if _supabase_client is not None:
+        return _supabase_client
     
-    return create_client(supabase_url, supabase_key)
+    with _supabase_lock:
+        # Check again inside lock (another thread might have initialized it)
+        if _supabase_client is not None:
+            return _supabase_client
+        
+        # Initialize new client
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+        
+        if not supabase_url or not supabase_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
+        
+        _supabase_client = create_client(supabase_url, supabase_key)
+        logger.info("✓ Supabase client initialized with connection pooling (thread-safe)")
+        
+        return _supabase_client
 
 
 def get_airtable_client() -> Api:
@@ -808,7 +828,7 @@ def distribute_campaign(campaign_id: str):
     """
     try:
         # Get configuration from environment variables
-        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         
         # Get profiles_per_table from request body (should be from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
         data = request.get_json() or {}
@@ -945,7 +965,7 @@ def airtable_sync(campaign_id: str):
     """
     try:
         # Get configuration from environment variables
-        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
         
         if not airtable_base_id:
@@ -1142,7 +1162,7 @@ def cleanup():
     }
     try:
         # Get configuration
-        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
         
         if not airtable_base_id:
@@ -1365,7 +1385,7 @@ def sync_airtable_statuses():
     """
     try:
         # Get configuration
-        num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
         
         if not airtable_base_id:
@@ -1860,7 +1880,7 @@ def run_daily():
         print("-" * 70)
         
         try:
-            num_va_tables = int(os.getenv('NUM_VA_TABLES'))
+            num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
             # profiles_per_table already defined at the top from request body
             
             # Fetch unassigned profiles

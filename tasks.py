@@ -5,6 +5,7 @@ import os
 import logging
 import random
 import uuid
+import threading
 from typing import List, Dict, Any
 from datetime import datetime, timezone, date, timedelta
 from celery import Task, chord, group
@@ -19,15 +20,44 @@ from utils.batch_processor import batch_insert_profiles, batch_update_assignment
 logger = logging.getLogger(__name__)
 
 
+# ===================================================================
+# SUPABASE CLIENT WITH CONNECTION POOLING (THREAD-SAFE)
+# ===================================================================
+# Use singleton pattern with thread lock to prevent race conditions
+_supabase_client = None
+_supabase_lock = threading.Lock()
+
 def get_supabase_client() -> Client:
-    """Initialize and return Supabase client."""
-    supabase_url = os.getenv('SUPABASE_URL')
-    supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+    """
+    Initialize and return Supabase client.
     
-    if not supabase_url or not supabase_key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
+    OPTIMIZED: Uses thread-safe singleton pattern to reuse the same client instance
+    across all Celery tasks, preventing connection leaks and race conditions.
+    """
+    global _supabase_client
     
-    return create_client(supabase_url, supabase_key)
+    # Double-checked locking pattern for thread safety
+    if _supabase_client is not None:
+        return _supabase_client
+    
+    with _supabase_lock:
+        # Check again inside lock (another thread might have initialized it)
+        if _supabase_client is not None:
+            return _supabase_client
+        
+        # Initialize new client
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+        
+        if not supabase_url or not supabase_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
+        
+        _supabase_client = create_client(supabase_url, supabase_key)
+        logger.info("✓ Supabase client initialized with connection pooling (Celery, thread-safe)")
+        
+        return _supabase_client
+    
+    return _supabase_client
 
 
 class BaseTask(Task):

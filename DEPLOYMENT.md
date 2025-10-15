@@ -1,13 +1,15 @@
 # 🚀 Production Deployment Guide
 
-This guide covers deploying the Instagram Scraper API to Heroku with asynchronous task processing.
+This guide covers deploying the Instagram Scraper API with asynchronous task processing to either **Heroku** or **Render**.
 
 ## 📋 Table of Contents
 1. [Architecture Overview](#architecture-overview)
 2. [Prerequisites](#prerequisites)
 3. [Local Development Setup](#local-development-setup)
 4. [Database Setup (Supabase)](#database-setup)
-5. [Heroku Deployment](#heroku-deployment)
+5. [Deployment Options](#deployment-options)
+   - [Option A: Heroku Deployment](#option-a-heroku-deployment)
+   - [Option B: Render Deployment](#option-b-render-deployment)
 6. [Environment Variables](#environment-variables)
 7. [Testing the API](#testing-the-api)
 8. [Monitoring & Troubleshooting](#monitoring--troubleshooting)
@@ -238,7 +240,13 @@ Ensure these tables exist (created previously):
 
 ---
 
-## 🚀 Heroku Deployment
+## 🚀 Deployment Options
+
+You can deploy this application to either **Heroku** or **Render**. Both support the required features (Redis, workers, etc.).
+
+---
+
+## Option A: Heroku Deployment
 
 ### 1. Create Heroku App
 
@@ -329,6 +337,70 @@ heroku ps:scale worker=4:standard-1x
 # Verify dynos running
 heroku ps
 ```
+
+---
+
+## Option B: Render Deployment
+
+### Prerequisites
+- Code pushed to GitHub repository
+- `render.yaml` configuration file in repository
+- All dependencies listed in `requirements.txt`
+
+### 1. Create Render Account & Connect GitHub
+
+1. Go to [Render](https://render.com)
+2. Sign up or log in using your GitHub account
+3. Authorize Render to access your repositories
+
+### 2. Create New Blueprint Instance
+
+1. Click **"New +"** in the top right
+2. Select **"Blueprint"** from the dropdown
+3. **Connect Repository**:
+   - Select your repository
+   - Branch: `main`
+4. **Name the Blueprint**: `aivs-instagram-scraper`
+5. Click **"Apply"**
+
+Render will automatically detect `render.yaml` and create:
+- ✅ **Redis service** - Free tier
+- ✅ **Web service** - Free tier (runs both Flask API and Celery worker)
+
+### 3. Configure Environment Variables
+
+After services are created:
+
+1. Go to the web service in Render dashboard
+2. Click **"Environment"** tab
+3. Add all required environment variables (see table below)
+4. Click **"Save Changes"**
+5. Service will automatically redeploy
+
+### 4. Wait for Deployment
+
+Monitor deployment logs:
+- **Redis**: Ready in ~30 seconds
+- **Web Service**: Build and deploy in ~2-3 minutes
+
+### 5. Verify Render Deployment
+
+```bash
+# Test health endpoint
+curl https://your-app.onrender.com/healthz
+
+# Test async scraping
+curl -X POST https://your-app.onrender.com/api/scrape-followers \
+  -H "Content-Type: application/json" \
+  -d '{"accounts": ["testaccount"], "targetGender": "male", "totalScrapeCount": 10}'
+```
+
+### Render Free Tier Notes
+
+- Service spins down after 15 min of inactivity
+- First request after sleep takes ~30 seconds (cold start)
+- 512 MB RAM (runs both Flask API + Celery worker in same container)
+- Upgrade to $7/month for always-on service with 2 GB RAM
 
 ---
 
