@@ -16,6 +16,7 @@ from tasks import (
     ingest_profiles_batch,
     daily_pipeline_orchestrator
 )
+from utils.base_id_utils import get_base_id_from_request, validate_base_id, get_default_base_id
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +39,18 @@ def register_async_endpoints(app, get_supabase_client):
         {
             "accounts": ["username1", "username2", ...],
             "targetGender": "male" (optional, defaults to "male"),
-            "totalScrapeCount": 150 (optional, total accounts to scrape)
+            "totalScrapeCount": 150 (optional, total accounts to scrape),
+            "base_id": "appXYZ123ABC" (optional, defaults to 'default_instagram')
         }
+        
+        OR pass base_id via header:
+        X-Base-Id: appXYZ123ABC
         
         Returns:
         {
             "success": true,
             "job_id": "uuid",
+            "base_id": "appXYZ123ABC",
             "status_url": "/api/job-status/uuid",
             "results_url": "/api/job-results/uuid",
             "message": "Job queued successfully. Poll status_url for progress."
@@ -68,6 +74,15 @@ def register_async_endpoints(app, get_supabase_client):
                 return jsonify({
                     'success': False,
                     'error': 'Accounts must be a non-empty list'
+                }), 400
+            
+            # Extract base_id with fallback to default
+            base_id = get_base_id_from_request()
+            
+            if not validate_base_id(base_id):
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid base_id format: {base_id}'
                 }), 400
             
             # Compute per-account scrape count
@@ -97,9 +112,9 @@ def register_async_endpoints(app, get_supabase_client):
             account_batches = [accounts[i:i + batch_size] for i in range(0, len(accounts), batch_size)]
             total_batches = len(account_batches)
             
-            logger.info(f"Creating job {job_id} with {total_batches} batches")
+            logger.info(f"Creating job {job_id} with {total_batches} batches for base_id={base_id}")
             
-            # Insert job record
+            # Insert job record with base_id
             supabase.table('scrape_jobs').insert({
                 'job_id': job_id,
                 'status': 'queued',
@@ -110,6 +125,7 @@ def register_async_endpoints(app, get_supabase_client):
                 'current_batch': 0,
                 'progress': 0.0,
                 'profiles_scraped': 0,
+                'base_id': base_id,
                 'created_at': datetime.now(timezone.utc).isoformat()
             }).execute()
             
@@ -142,11 +158,12 @@ def register_async_endpoints(app, get_supabase_client):
                 .eq('job_id', job_id)\
                 .execute()
             
-            logger.info(f"Job {job_id} queued successfully with {total_batches} batches")
+            logger.info(f"Job {job_id} queued successfully with {total_batches} batches for base_id={base_id}")
             
             return jsonify({
                 'success': True,
                 'job_id': job_id,
+                'base_id': base_id,
                 'status_url': f'/api/job-status/{job_id}',
                 'results_url': f'/api/job-results/{job_id}',
                 'total_batches': total_batches,

@@ -36,6 +36,11 @@ import time
 from pyairtable import Api
 import traceback
 
+# Import utility modules
+from utils.airtable_creator import AirtableCreator, create_airtable_base
+from utils.base_id_utils import get_base_id_from_request, ensure_base_id, ensure_base_id_list, validate_base_id
+from utils.rls_context import set_rls_context, get_rls_context
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -95,6 +100,43 @@ limiter = Limiter(
 )
 
 logger.info("Flask app initialized with CORS and rate limiting")
+
+
+# ===================================================================
+# RLS CONTEXT SETUP
+# ===================================================================
+# Initialize RLS context on every request with the base_id
+# This allows Supabase RLS policies to filter data per tenant
+
+@app.before_request
+def setup_rls_context():
+    """
+    Set up RLS context for the current request.
+    
+    Extracts base_id from request headers/body and sets it in the RLS context,
+    which is then used by Supabase RLS policies to filter data per tenant.
+    """
+    try:
+        # Extract base_id from request (uses priority: header > body > default)
+        base_id = get_base_id_from_request()
+        
+        # Validate base_id format
+        if not validate_base_id(base_id):
+            logger.warning(f"Invalid base_id format in request: {base_id}")
+            # Still set it (validation error will be caught later in endpoint)
+        
+        # Set RLS context for this request
+        set_rls_context(base_id)
+        
+        logger.debug(f"RLS context initialized for base_id={base_id}")
+        
+    except Exception as e:
+        logger.error(f"Error setting up RLS context: {e}")
+        # Default to 'default_instagram' if any error
+        set_rls_context('default_instagram')
+
+
+logger.info("✓ RLS context setup enabled for multi-tenant isolation")
 
 
 # ===================================================================
@@ -538,12 +580,17 @@ def ingest_profiles():
                 "username": "john_doe",
                 "full_name": "John Doe"
             }
-        ]
+        ],
+        "base_id": "appXYZ123ABC" (optional, defaults to 'default_instagram')
     }
+    
+    OR pass base_id via header:
+    X-Base-Id: appXYZ123ABC
     
     Returns:
     {
         "success": true,
+        "base_id": "appXYZ123ABC",
         "inserted_raw": 10,
         "added_to_global": 8,
         "skipped_existing": 2
@@ -570,10 +617,20 @@ def ingest_profiles():
         if len(profiles) == 0:
             return jsonify({
                 'success': True,
+                'base_id': get_base_id_from_request(),
                 'inserted_raw': 0,
                 'added_to_global': 0,
                 'skipped_existing': 0
             })
+        
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
+        
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
         
         # Initialize Supabase client
         supabase = get_supabase_client()
@@ -582,6 +639,8 @@ def ingest_profiles():
         inserted_raw = 0
         added_to_global = 0
         skipped_existing = 0
+        
+        logger.info(f"Ingesting {len(profiles)} profiles for base_id={base_id}")
         
         # Process each profile
         for profile in profiles:
@@ -594,48 +653,54 @@ def ingest_profiles():
             username = profile['username']
             full_name = profile.get('full_name', '')
             
-            # Step 1: Insert into raw_scraped_profiles
+            # Step 1: Insert into raw_scraped_profiles with base_id
             try:
                 supabase.table('raw_scraped_profiles').insert({
                     'id': profile_id,
                     'username': username,
                     'full_name': full_name,
+                    'base_id': base_id,
                     'scraped_at': datetime.now(timezone.utc).isoformat()
                 }).execute()
                 inserted_raw += 1
-                print(f"✓ Inserted {username} into raw_scraped_profiles")
+                print(f"✓ Inserted {username} into raw_scraped_profiles (base_id={base_id})")
             except Exception as e:
                 print(f"Warning: Failed to insert {username} into raw_scraped_profiles: {str(e)}")
             
-            # Step 2: Check if profile exists in global_usernames
+            # Step 2: Check if profile exists in global_usernames (scoped to base_id)
             try:
                 existing = supabase.table('global_usernames')\
                     .select('id')\
                     .eq('id', profile_id)\
+                    .eq('base_id', base_id)\
                     .execute()
                 
                 if existing.data and len(existing.data) > 0:
-                    # Profile already exists in global_usernames
+                    # Profile already exists in global_usernames for this base_id
                     skipped_existing += 1
-                    print(f"○ Skipped {username} (already in global_usernames)")
+                    print(f"○ Skipped {username} (already in global_usernames for base_id={base_id})")
                 else:
-                    # Profile doesn't exist, insert it
+                    # Profile doesn't exist for this base_id, insert it
                     supabase.table('global_usernames').insert({
                         'id': profile_id,
                         'username': username,
                         'full_name': full_name,
                         'used': False,
+                        'base_id': base_id,
                         'created_at': datetime.now(timezone.utc).isoformat()
                     }).execute()
                     added_to_global += 1
-                    print(f"✓ Added {username} to global_usernames")
+                    print(f"✓ Added {username} to global_usernames (base_id={base_id})")
                     
             except Exception as e:
                 print(f"Warning: Failed to process {username} for global_usernames: {str(e)}")
                 skipped_existing += 1
         
+        logger.info(f"Ingest complete for base_id={base_id}: {inserted_raw} raw, {added_to_global} new global, {skipped_existing} skipped")
+        
         return jsonify({
             'success': True,
+            'base_id': base_id,
             'inserted_raw': inserted_raw,
             'added_to_global': added_to_global,
             'skipped_existing': skipped_existing
@@ -662,19 +727,33 @@ def daily_selection():
     Expected JSON payload:
     {
         "campaign_date": "2025-10-02" (optional, defaults to today),
-        "profiles_per_table": 180 (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
+        "profiles_per_table": 180 (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE),
+        "base_id": "appXYZ123ABC" (optional, defaults to 'default_instagram')
     }
+    
+    OR pass base_id via header:
+    X-Base-Id: appXYZ123ABC
     
     Returns:
     {
         "success": true,
         "campaign_id": "uuid",
+        "base_id": "appXYZ123ABC",
         "total_selected": 14400
     }
     """
     try:
         # Get JSON data from request
         data = request.get_json() or {}
+        
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
+        
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
         
         # Get profiles_per_table from client (should be NEXT_PUBLIC_PROFILES_PER_TABLE)
         profiles_per_table = data.get('profiles_per_table')
@@ -703,48 +782,50 @@ def daily_selection():
         else:
             campaign_date_obj = date.today()
         
-        print(f"Starting daily selection for {campaign_date_obj}...")
+        print(f"Starting daily selection for {campaign_date_obj} with base_id={base_id}...")
         print(f"Target: {target_count} profiles")
         
         # Initialize Supabase client
         supabase = get_supabase_client()
         
-        # Step 1: Create a new campaign
+        # Step 1: Create a new campaign with base_id
         campaign_id = str(uuid.uuid4())
         
         campaign_response = supabase.table('campaigns').insert({
             'campaign_id': campaign_id,
             'campaign_date': campaign_date_obj.isoformat(),
             'total_assigned': 0,
+            'base_id': base_id,
             'status': False,  # Default to False (failed), will update to True (success) after Airtable sync
             'created_at': datetime.now(timezone.utc).isoformat()
         }).execute()
         
-        print(f"✓ Created campaign: {campaign_id}")
+        print(f"✓ Created campaign: {campaign_id} (base_id={base_id})")
         
         # Step 2: Select up to target_count unused profiles from global_usernames
-        # Exclude female profiles - only select male and unknown
+        # Scoped to the specific base_id
         available_profiles = supabase.table('global_usernames')\
             .select('id, username, full_name')\
             .eq('used', False)\
+            .eq('base_id', base_id)\
             .limit(target_count)\
             .execute()
         
         if not available_profiles.data:
             return jsonify({
                 'success': False,
-                'error': 'No unused profiles available in global_usernames'
+                'error': f'No unused profiles available in global_usernames for base_id={base_id}'
             }), 400
         
         selected_profiles = available_profiles.data
         total_selected = len(selected_profiles)
         
-        print(f"✓ Selected {total_selected} unused profiles")
+        print(f"✓ Selected {total_selected} unused profiles from base_id={base_id}")
         
         # Step 3: Mark selected profiles as used
         profile_ids = [profile['id'] for profile in selected_profiles]
         
-        # Update all selected profiles to used=true
+        # Update all selected profiles to used=true (scoped to base_id)
         for profile_id in profile_ids:
             supabase.table('global_usernames')\
                 .update({
@@ -752,11 +833,12 @@ def daily_selection():
                     'used_at': datetime.now(timezone.utc).isoformat()
                 })\
                 .eq('id', profile_id)\
+                .eq('base_id', base_id)\
                 .execute()
         
-        print(f"✓ Marked {total_selected} profiles as used")
+        print(f"✓ Marked {total_selected} profiles as used for base_id={base_id}")
         
-        # Step 4: Insert into daily_assignments with placeholders
+        # Step 4: Insert into daily_assignments with placeholders and base_id
         assignments = []
         for profile in selected_profiles:
             assignments.append({
@@ -767,6 +849,7 @@ def daily_selection():
                 'id': profile['id'],
                 'username': profile['username'],
                 'full_name': profile['full_name'],
+                'base_id': base_id,
                 'status': 'pending',
                 'assigned_at': datetime.now(timezone.utc).isoformat()
             })
@@ -774,7 +857,7 @@ def daily_selection():
         # Batch insert assignments (Supabase handles this efficiently)
         supabase.table('daily_assignments').insert(assignments).execute()
         
-        print(f"✓ Inserted {total_selected} assignments")
+        print(f"✓ Inserted {total_selected} assignments for base_id={base_id}")
         
         # Step 5: Update campaign total_assigned
         supabase.table('campaigns')\
@@ -784,9 +867,12 @@ def daily_selection():
         
         print(f"✓ Updated campaign total_assigned to {total_selected}")
         
+        logger.info(f"Daily selection complete for base_id={base_id}: campaign_id={campaign_id}, total_selected={total_selected}")
+        
         return jsonify({
             'success': True,
             'campaign_id': campaign_id,
+            'base_id': base_id,
             'total_selected': total_selected,
             'campaign_date': campaign_date_obj.isoformat()
         })
@@ -814,19 +900,33 @@ def distribute_campaign(campaign_id: str):
     
     Optional JSON payload:
     {
-        "profiles_per_table": 180  (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
+        "profiles_per_table": 180,  (optional, should be sent from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
+        "base_id": "appXYZ123ABC"   (optional, defaults to 'default_instagram')
     }
+    
+    OR pass base_id via header:
+    X-Base-Id: appXYZ123ABC
     
     Returns:
     {
         "success": true,
         "campaign_id": "uuid",
+        "base_id": "appXYZ123ABC",
         "va_tables": 80,
         "assigned_per_table": 180,
         "total_distributed": 14400
     }
     """
     try:
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
+        
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
+        
         # Get configuration from environment variables
         num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         
@@ -847,31 +947,33 @@ def distribute_campaign(campaign_id: str):
             profiles_per_table = DEFAULT_PROFILES_PER_TABLE
             print(f"⚠️ WARNING: Client did not send profiles_per_table, using fallback: {profiles_per_table}")
 
-        print(f"Starting distribution for campaign {campaign_id}...")
+        print(f"Starting distribution for campaign {campaign_id} with base_id={base_id}...")
         print(f"Configuration: {num_va_tables} VA tables, {profiles_per_table} profiles per table")
         
         # Initialize Supabase client
         supabase = get_supabase_client()
         
-        # Step 1: Verify campaign exists
+        # Step 1: Verify campaign exists (scoped to base_id)
         campaign = supabase.table('campaigns')\
-            .select('campaign_id, campaign_date, total_assigned')\
+            .select('campaign_id, campaign_date, total_assigned, base_id')\
             .eq('campaign_id', campaign_id)\
+            .eq('base_id', base_id)\
             .execute()
         
         if not campaign.data or len(campaign.data) == 0:
             return jsonify({
                 'success': False,
-                'error': f'Campaign {campaign_id} not found'
+                'error': f'Campaign {campaign_id} not found for base_id={base_id}'
             }), 404
         
         campaign_info = campaign.data[0]
         print(f"✓ Found campaign: {campaign_info['campaign_date']} with {campaign_info['total_assigned']} assignments")
         
-        # Step 2: Fetch all unassigned profiles (va_table_number=0)
+        # Step 2: Fetch all unassigned profiles (va_table_number=0) scoped to base_id
         unassigned = supabase.table('daily_assignments')\
             .select('assignment_id, id, username, full_name')\
             .eq('campaign_id', campaign_id)\
+            .eq('base_id', base_id)\
             .eq('va_table_number', 0)\
             .execute()
         
@@ -925,9 +1027,12 @@ def distribute_campaign(campaign_id: str):
         # Calculate actual distribution stats
         tables_used = current_table if current_position == 1 else current_table
         
+        logger.info(f"Distribution complete for base_id={base_id}, campaign_id={campaign_id}: {distributed_count} profiles distributed across {tables_used} tables")
+        
         return jsonify({
             'success': True,
             'campaign_id': campaign_id,
+            'base_id': base_id,
             'va_tables': tables_used,
             'assigned_per_table': profiles_per_table,
             'total_distributed': distributed_count,
@@ -955,15 +1060,33 @@ def airtable_sync(campaign_id: str):
     URL Parameters:
         campaign_id: UUID of the campaign to sync
     
+    Optional JSON payload:
+    {
+        "base_id": "appXYZ123ABC" (optional, defaults to 'default_instagram')
+    }
+    
+    OR pass base_id via header:
+    X-Base-Id: appXYZ123ABC
+    
     Returns:
     {
         "success": true,
         "campaign_id": "uuid",
+        "base_id": "appXYZ123ABC",
         "tables_synced": 80,
         "records_synced": 14400
     }
     """
     try:
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
+        
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
+        
         # Get configuration from environment variables
         num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
         airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
@@ -974,33 +1097,35 @@ def airtable_sync(campaign_id: str):
                 'error': 'AIRTABLE_BASE_ID environment variable not set'
             }), 500
         
-        print(f"Starting Airtable sync for campaign {campaign_id}...")
+        print(f"Starting Airtable sync for campaign {campaign_id} with base_id={base_id}...")
         print(f"Configuration: {num_va_tables} VA tables, base ID: {airtable_base_id}")
         
         # Initialize clients
         supabase = get_supabase_client()
         airtable = get_airtable_client()
         
-        # Step 1: Verify campaign exists and fetch campaign_date
+        # Step 1: Verify campaign exists and fetch campaign_date (scoped to base_id)
         campaign = supabase.table('campaigns')\
-            .select('campaign_id, campaign_date, total_assigned')\
+            .select('campaign_id, campaign_date, total_assigned, base_id')\
             .eq('campaign_id', campaign_id)\
+            .eq('base_id', base_id)\
             .execute()
         
         if not campaign.data or len(campaign.data) == 0:
             return jsonify({
                 'success': False,
-                'error': f'Campaign {campaign_id} not found'
+                'error': f'Campaign {campaign_id} not found for base_id={base_id}'
             }), 404
         
         campaign_info = campaign.data[0]
         campaign_date = campaign_info['campaign_date']
         print(f"✓ Found campaign: {campaign_date} with {campaign_info['total_assigned']} assignments")
         
-        # Step 2: Fetch all assigned profiles (va_table_number > 0)
+        # Step 2: Fetch all assigned profiles (va_table_number > 0) scoped to base_id
         assigned = supabase.table('daily_assignments')\
             .select('va_table_number, position, id, username, full_name, status')\
             .eq('campaign_id', campaign_id)\
+            .eq('base_id', base_id)\
             .gt('va_table_number', 0)\
             .order('va_table_number')\
             .order('position')\
@@ -1097,6 +1222,7 @@ def airtable_sync(campaign_id: str):
         supabase.table('campaigns')\
             .update({'status': campaign_status})\
             .eq('campaign_id', campaign_id)\
+            .eq('base_id', base_id)\
             .execute()
         
         status_text = 'success' if campaign_status else 'failed'
@@ -1104,9 +1230,12 @@ def airtable_sync(campaign_id: str):
         print(f"  - Expected tables: {num_va_tables}, Synced: {tables_synced}")
         print(f"  - Total records synced: {records_synced}")
         
+        logger.info(f"Airtable sync complete for base_id={base_id}, campaign_id={campaign_id}: {tables_synced} tables, {records_synced} records")
+        
         return jsonify({
             'success': True,
             'campaign_id': campaign_id,
+            'base_id': base_id,
             'tables_synced': tables_synced,
             'records_synced': records_synced,
             'campaign_status': campaign_status
@@ -2146,6 +2275,250 @@ def health_check():
         'version': os.getenv('APP_VERSION', '1.0.0'),
         'async_enabled': True
     })
+
+
+
+# ===================================================================
+# AIRTABLE BASE CREATION
+# ===================================================================
+
+@app.route('/api/airtable/create-base', methods=['POST'])
+@limiter.limit("5 per hour")  # Strict limit for base creation
+def create_airtable_base_endpoint():
+    """
+    Create a new Airtable base with VA tables for a scraping job.
+    
+    IMPORTANT: You must create the base manually in Airtable first
+    and provide its base_id or link. This endpoint will populate it with tables.
+    
+    Request Body:
+    {
+        // EITHER provide base_id OR airtable_link
+        "base_id": "appXYZ123ABC",                                    // Option 1: Direct base ID
+        "airtable_link": "https://airtable.com/app1ovtH.../tbl.../",  // Option 2: Airtable URL
+        
+        "num_vas": 80,               // Optional: Number of VA tables (default: 80)
+        "base_name": "Client Name"   // Optional: Display name for logging
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "base_id": "appXYZ123ABC",
+        "base_name": "Client Name",
+        "tables_created": 80,
+        "tables_failed": 0,
+        "verification": {...}
+    }
+    """
+    try:
+        from utils.airtable_creator import extract_base_id_from_url, validate_base_id
+        
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Request body is required'
+            }), 400
+        
+        # Accept either base_id or airtable_link
+        base_id_or_url = data.get('base_id') or data.get('airtable_link')
+        
+        if not base_id_or_url:
+            return jsonify({
+                'success': False,
+                'error': 'Either "base_id" or "airtable_link" is required'
+            }), 400
+        
+        # Extract base_id from URL if needed
+        base_id = extract_base_id_from_url(base_id_or_url)
+        
+        if not base_id:
+            return jsonify({
+                'success': False,
+                'error': f'Could not extract base ID from: {base_id_or_url}'
+            }), 400
+        
+        # Validate base_id format
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}. Should start with "app" followed by alphanumeric characters'
+            }), 400
+        
+        # Optional parameters
+        num_vas = data.get('num_vas', 80)
+        base_name = data.get('base_name')
+        
+        # Validate num_vas
+        if not isinstance(num_vas, int) or num_vas < 1 or num_vas > 200:
+            return jsonify({
+                'success': False,
+                'error': 'num_vas must be an integer between 1 and 200'
+            }), 400
+        
+        # Get Airtable token
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        if not airtable_token:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_ACCESS_TOKEN not configured on server'
+            }), 500
+        
+        logger.info(f"Creating Airtable base: {base_id} with {num_vas} VA tables")
+        
+        # Create the base tables
+        result = create_airtable_base(
+            base_id=base_id,
+            num_vas=num_vas,
+            airtable_token=airtable_token,
+            base_name=base_name
+        )
+        
+        # If tables were successfully created, save to Supabase
+        if result['success'] and result['setup_results']['tables_created'] > 0:
+            try:
+                supabase = get_supabase_client()
+                
+                # Create a simple record noting the Airtable base creation
+                # Store base_id in a way that's compatible with existing schema
+                logger.info(f"✓ Airtable base {base_id} created with {result['setup_results']['tables_created']} tables")
+                logger.info(f"Base details: {base_name or base_id}, {num_vas} VAs")
+                
+                # Optionally store in environment or config for later use
+                # The base_id should be used when syncing campaigns
+                
+            except Exception as supabase_error:
+                logger.warning(f"Error during post-creation processing: {str(supabase_error)}")
+                # Don't fail the entire operation
+        
+        # Prepare response
+        response = {
+            'success': result['success'],
+            'base_id': result['base_id'],
+            'base_name': result['base_name'],
+            'tables_created': result['setup_results']['tables_created'],
+            'tables_skipped': result['setup_results'].get('tables_skipped', 0),
+            'tables_failed': result['setup_results']['tables_failed'],
+            'total_tables': result['setup_results']['total_tables'],
+            'message': result.get('message', f'Successfully created {result["setup_results"]["tables_created"]} tables in Airtable base {base_id}')
+        }
+        
+        # Add table IDs if available
+        if 'table_ids' in result:
+            response['table_ids'] = result['table_ids']
+        
+        # Add failed tables if any
+        if result['setup_results']['failed_tables']:
+            response['failed_tables'] = result['setup_results']['failed_tables']
+        
+        # Add verification results if present
+        if 'verification' in result:
+            response['verification'] = result['verification']
+        
+        status_code = 200 if result['success'] else 500
+        return jsonify(response), status_code
+        
+    except Exception as e:
+        logger.error(f"Error creating Airtable base: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/airtable/verify-base', methods=['POST'])
+@limiter.limit("20 per hour")
+def verify_airtable_base_endpoint():
+    """
+    Verify that an Airtable base has the correct structure.
+    
+    Request Body:
+    {
+        // EITHER provide base_id OR airtable_link
+        "base_id": "appXYZ123ABC",                                    // Option 1: Direct base ID
+        "airtable_link": "https://airtable.com/app1ovtH.../tbl.../",  // Option 2: Airtable URL
+        
+        "num_vas": 80                // Optional: Expected number of VA tables (default: 80)
+    }
+    
+    Returns:
+    {
+        "valid": true,
+        "base_id": "appXYZ123ABC",
+        "tables_found": 80,
+        "tables_expected": 80,
+        "missing_tables": [],
+        "extra_tables": []
+    }
+    """
+    try:
+        from utils.airtable_creator import extract_base_id_from_url, validate_base_id
+        
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Request body is required'
+            }), 400
+        
+        # Accept either base_id or airtable_link
+        base_id_or_url = data.get('base_id') or data.get('airtable_link')
+        
+        if not base_id_or_url:
+            return jsonify({
+                'success': False,
+                'error': 'Either "base_id" or "airtable_link" is required'
+            }), 400
+        
+        # Extract base_id from URL if needed
+        base_id = extract_base_id_from_url(base_id_or_url)
+        
+        if not base_id:
+            return jsonify({
+                'success': False,
+                'error': f'Could not extract base ID from: {base_id_or_url}'
+            }), 400
+        
+        # Validate base_id format
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
+        
+        # Optional parameters
+        num_vas = data.get('num_vas', 80)
+        
+        # Get Airtable token
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        if not airtable_token:
+            return jsonify({
+                'success': False,
+                'error': 'AIRTABLE_ACCESS_TOKEN not configured on server'
+            }), 500
+        
+        logger.info(f"Verifying Airtable base: {base_id}")
+        
+        # Verify the base
+        creator = AirtableCreator(airtable_token)
+        result = creator.verify_base_structure(base_id, num_vas)
+        
+        # Add base_id to response for reference
+        result['base_id'] = base_id
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        logger.error(f"Error verifying Airtable base: {str(e)}")
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/healthz', methods=['GET'])

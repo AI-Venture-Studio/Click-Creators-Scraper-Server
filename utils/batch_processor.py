@@ -14,7 +14,8 @@ def batch_insert_profiles(
     supabase: Client,
     profiles: List[Dict],
     batch_size: int = 1000,
-    rate_limit_delay: float = 0.1
+    rate_limit_delay: float = 0.1,
+    base_id: str = 'default_instagram'
 ) -> Tuple[int, int, int]:
     """
     Insert profiles into Supabase using TRUE bulk inserts for maximum performance.
@@ -37,6 +38,7 @@ def batch_insert_profiles(
         profiles: List of profile dictionaries with id, username, full_name
         batch_size: Number of profiles to insert per batch (default: 1000)
         rate_limit_delay: Delay in seconds between batches (default: 0.1 = 100ms)
+        base_id: Multi-tenant identifier for data isolation (default: 'default_instagram')
         
     Returns:
         Tuple of (inserted_raw, added_to_global, skipped_existing)
@@ -106,7 +108,8 @@ def batch_insert_profiles(
             'id': profile_id,
             'username': username,
             'full_name': full_name,
-            'scraped_at': current_timestamp
+            'scraped_at': current_timestamp,
+            'base_id': base_id
         })
         
         # Only add to global_usernames if it doesn't exist
@@ -116,7 +119,8 @@ def batch_insert_profiles(
                 'username': username,
                 'full_name': full_name,
                 'used': False,
-                'created_at': current_timestamp  # Fixed: was 'added_at', should be 'created_at'
+                'created_at': current_timestamp,  # Fixed: was 'added_at', should be 'created_at'
+                'base_id': base_id
             })
         else:
             skipped_existing += 1
