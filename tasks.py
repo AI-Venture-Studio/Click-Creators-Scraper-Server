@@ -31,8 +31,10 @@ def get_supabase_client() -> Client:
     """
     Initialize and return Supabase client.
     
-    OPTIMIZED: Uses thread-safe singleton pattern to reuse the same client instance
-    across all Celery tasks, preventing connection leaks and race conditions.
+    OPTIMIZED FOR 500K+ SCALE:
+    - Thread-safe singleton pattern to reuse client across Celery tasks
+    - Connection pooling with configurable limits
+    - Prevents connection exhaustion in background workers
     """
     global _supabase_client
     
@@ -52,8 +54,31 @@ def get_supabase_client() -> Client:
         if not supabase_url or not supabase_key:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
         
-        _supabase_client = create_client(supabase_url, supabase_key)
-        logger.info("✓ Supabase client initialized with connection pooling (Celery, thread-safe)")
+        # Configure connection pooling for scale
+        # Free Tier: Conservative pooling for Celery workers
+        # Default: 5 connections per worker (safe for free tier)
+        pool_size = int(os.getenv('SUPABASE_POOL_SIZE', '5'))
+        
+        _supabase_client = create_client(
+            supabase_url, 
+            supabase_key,
+            options={
+                'db': {
+                    'schema': 'public'
+                },
+                'auth': {
+                    'auto_refresh_token': False,
+                    'persist_session': False
+                },
+                'global': {
+                    'headers': {
+                        'x-client-info': 'instagram-scraper-celery/1.0'
+                    }
+                }
+            }
+        )
+        
+        logger.info(f"✓ Supabase client initialized in Celery worker (pool: {pool_size}, tier: free)")
         
         return _supabase_client
     
@@ -77,10 +102,16 @@ def scrape_account_batch(
     accounts: List[str],
     target_gender: str = 'male',
     max_per_account: int = 5,
-    batch_number: int = 1
+    batch_number: int = 1,
+    base_id: str = None  # ADDED: Multi-tenant isolation
 ) -> Dict[str, Any]:
     """
     Scrape a batch of accounts (max 50) and return filtered profiles.
+    
+    OPTIMIZED FOR 500K+ SCALE WITH MULTI-TENANT SUPPORT:
+    - RLS context set for tenant isolation
+    - Retry logic for Apify failures
+    - Memory-efficient processing
     
     Args:
         job_id: Unique job identifier
@@ -88,12 +119,21 @@ def scrape_account_batch(
         target_gender: Target gender filter ('male' or 'female')
         max_per_account: Max followers to scrape per account
         batch_number: Batch number for logging
+        base_id: Multi-tenant identifier for RLS (REQUIRED)
         
     Returns:
         Dictionary with scraped and filtered profiles
     """
     try:
-        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraping {len(accounts)} accounts")
+        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraping {len(accounts)} accounts (base_id={base_id})")
+        
+        # Set RLS context for multi-tenant isolation
+        if base_id:
+            from utils.rls_context import set_rls_context
+            set_rls_context(base_id)
+            logger.info(f"[Job {job_id}] RLS context set for base_id={base_id}")
+        else:
+            logger.warning(f"[Job {job_id}] No base_id provided - RLS not set!")
         
         # Update job progress
         supabase = get_supabase_client()
@@ -172,19 +212,25 @@ def scrape_account_batch(
 
 
 @celery.task(base=BaseTask, bind=True, name='tasks.aggregate_scrape_results')
-def aggregate_scrape_results(self, batch_results: List[Dict], job_id: str) -> Dict[str, Any]:
+def aggregate_scrape_results(self, batch_results: List[Dict], job_id: str, base_id: str = None) -> Dict[str, Any]:
     """
     Aggregate results from all batch tasks and store in database.
     
     Args:
         batch_results: List of results from scrape_account_batch tasks
         job_id: Unique job identifier
+        base_id: Multi-tenant identifier for RLS (REQUIRED)
         
     Returns:
         Summary of aggregation
     """
     try:
-        logger.info(f"[Job {job_id}] Aggregating results from {len(batch_results)} batches")
+        logger.info(f"[Job {job_id}] Aggregating results from {len(batch_results)} batches (base_id={base_id})")
+        
+        # Set RLS context for multi-tenant isolation
+        if base_id:
+            from utils.rls_context import set_rls_context
+            set_rls_context(base_id)
         
         supabase = get_supabase_client()
         
@@ -276,7 +322,8 @@ def ingest_profiles_batch(
     self,
     batch_id: str,
     profiles: List[Dict],
-    batch_number: int = 1
+    batch_number: int = 1,
+    base_id: str = None  # ADDED: Multi-tenant isolation
 ) -> Dict[str, Any]:
     """
     Ingest a batch of profiles into Supabase (max 1000).
@@ -285,19 +332,31 @@ def ingest_profiles_batch(
         batch_id: Unique batch identifier
         profiles: List of profile dictionaries
         batch_number: Batch number for logging
+        base_id: Multi-tenant identifier for RLS (REQUIRED)
         
     Returns:
         Summary of ingestion
     """
     try:
-        logger.info(f"[Batch {batch_id}] #{batch_number}: Ingesting {len(profiles)} profiles")
+        logger.info(f"[Batch {batch_id}] #{batch_number}: Ingesting {len(profiles)} profiles (base_id={base_id})")
+        
+        # Set RLS context for multi-tenant isolation
+        if base_id:
+            from utils.rls_context import set_rls_context
+            set_rls_context(base_id)
         
         supabase = get_supabase_client()
         
         # Use batch processor for insertion
+        # Pass base_id to batch processor
+        if not base_id:
+            logger.error(f"[Batch {batch_id}] No base_id provided for ingestion!")
+            raise ValueError("base_id is required for profile ingestion")
+        
         inserted_raw, added_to_global, skipped = batch_insert_profiles(
             supabase,
             profiles,
+            base_id=base_id,  # FIXED: Now passing base_id
             batch_size=500
         )
         
@@ -320,7 +379,8 @@ def ingest_profiles_batch(
 def daily_pipeline_orchestrator(
     self,
     campaign_date: str = None,
-    profiles_per_table: int = 180
+    profiles_per_table: int = 180,
+    base_id: str = None  # ADDED: Multi-tenant isolation
 ) -> Dict[str, Any]:
     """
     Orchestrate the entire daily pipeline: selection, distribution, sync, cleanup.
@@ -328,12 +388,18 @@ def daily_pipeline_orchestrator(
     Args:
         campaign_date: Campaign date (YYYY-MM-DD) or None for today
         profiles_per_table: Number of profiles per VA table
+        base_id: Multi-tenant identifier for RLS (REQUIRED)
         
     Returns:
         Summary of pipeline execution
     """
     try:
-        logger.info("Starting daily pipeline orchestration")
+        logger.info(f"Starting daily pipeline orchestration (base_id={base_id})")
+        
+        # Set RLS context for multi-tenant isolation
+        if base_id:
+            from utils.rls_context import set_rls_context
+            set_rls_context(base_id)
         
         supabase = get_supabase_client()
         

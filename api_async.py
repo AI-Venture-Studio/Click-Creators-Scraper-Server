@@ -21,19 +21,24 @@ from utils.base_id_utils import get_base_id_from_request, validate_base_id
 logger = logging.getLogger(__name__)
 
 
-def register_async_endpoints(app, get_supabase_client):
+def register_async_endpoints(app, get_supabase_client, limiter=None):
     """
-    Register async endpoints to Flask app.
+    Register async endpoints to Flask app with rate limiting.
     
     Args:
         app: Flask application instance
         get_supabase_client: Function to get Supabase client
+        limiter: Flask-Limiter instance for rate limiting
     """
     
+    # Decorate scrape endpoint with strict rate limit
     @app.route('/api/scrape-followers', methods=['POST'])
+    @limiter.limit("10 per hour") if limiter else (lambda f: f)
     def scrape_followers_async():
         """
         ASYNC: Queue Instagram follower scraping job.
+        
+        RATE LIMITED: 10 requests per hour (expensive Apify operation at scale)
         
         Expected JSON payload:
         {
@@ -133,6 +138,7 @@ def register_async_endpoints(app, get_supabase_client):
             
             # Queue batch tasks using Celery chord pattern
             # All batches run in parallel, then aggregation runs after all complete
+            # FIXED: Pass base_id to all tasks for multi-tenant isolation
             batch_tasks = []
             for i, batch in enumerate(account_batches, 1):
                 task = scrape_account_batch.s(
@@ -140,13 +146,15 @@ def register_async_endpoints(app, get_supabase_client):
                     accounts=batch,
                     target_gender=target_gender,
                     max_per_account=per_account_count,
-                    batch_number=i
+                    batch_number=i,
+                    base_id=base_id  # ADDED: Multi-tenant isolation
                 )
                 batch_tasks.append(task)
             
             # Create chord: all batches → aggregation
+            # FIXED: Pass base_id to aggregation task
             workflow = chord(batch_tasks)(
-                aggregate_scrape_results.s(job_id=job_id)
+                aggregate_scrape_results.s(job_id=job_id, base_id=base_id)
             )
             
             # Update job to processing
@@ -336,9 +344,12 @@ def register_async_endpoints(app, get_supabase_client):
     
     
     @app.route('/api/ingest', methods=['POST'])
+    @limiter.limit("30 per hour") if limiter else (lambda f: f)
     def ingest_profiles_async():
         """
         ASYNC: Queue profile ingestion job.
+        
+        RATE LIMITED: 30 requests per hour (database-intensive operation)
         
         Expected JSON payload:
         {
@@ -384,19 +395,23 @@ def register_async_endpoints(app, get_supabase_client):
                     'message': 'No profiles to ingest'
                 })
             
+            # Extract base_id with fallback to default
+            base_id = get_base_id_from_request()
+            
             # Split profiles into batches of 1000
             batch_size = 1000
             profile_batches = [profiles[i:i + batch_size] for i in range(0, len(profiles), batch_size)]
             batch_id = str(uuid.uuid4())
             
-            logger.info(f"Queueing ingestion {batch_id}: {len(profiles)} profiles in {len(profile_batches)} batches")
+            logger.info(f"Queueing ingestion {batch_id}: {len(profiles)} profiles in {len(profile_batches)} batches (base_id={base_id})")
             
-            # Queue batch tasks
+            # Queue batch tasks - FIXED: Pass base_id to tasks
             for i, batch in enumerate(profile_batches, 1):
                 ingest_profiles_batch.delay(
                     batch_id=batch_id,
                     profiles=batch,
-                    batch_number=i
+                    batch_number=i,
+                    base_id=base_id  # ADDED: Multi-tenant isolation
                 )
             
             return jsonify({
@@ -416,9 +431,12 @@ def register_async_endpoints(app, get_supabase_client):
     
     
     @app.route('/api/run-daily', methods=['POST'])
+    @limiter.limit("5 per day") if limiter else (lambda f: f)
     def run_daily_async():
         """
         ASYNC: Queue daily pipeline orchestration.
+        
+        RATE LIMITED: 5 requests per day (should only run once daily)
         
         Optional JSON payload:
         {
@@ -439,12 +457,16 @@ def register_async_endpoints(app, get_supabase_client):
             campaign_date = data.get('campaign_date')
             profiles_per_table = data.get('profiles_per_table', 180)
             
-            logger.info(f"Queueing daily pipeline: date={campaign_date}, profiles_per_table={profiles_per_table}")
+            # Extract base_id with fallback to default
+            base_id = get_base_id_from_request()
             
-            # Queue orchestrator task
+            logger.info(f"Queueing daily pipeline: date={campaign_date}, profiles_per_table={profiles_per_table}, base_id={base_id}")
+            
+            # Queue orchestrator task - FIXED: Pass base_id
             task = daily_pipeline_orchestrator.delay(
                 campaign_date=campaign_date,
-                profiles_per_table=profiles_per_table
+                profiles_per_table=profiles_per_table,
+                base_id=base_id  # ADDED: Multi-tenant isolation
             )
             
             return jsonify({

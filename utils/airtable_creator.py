@@ -158,7 +158,7 @@ def create_airtable_tables(
                     },
                     {
                         "name": "progress_status",
-                        "type": "multipleSelects",
+                        "type": "singleSelect",
                         "description": "Current status of the outreach",
                         "options": {
                             "choices": [

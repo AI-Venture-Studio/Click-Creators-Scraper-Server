@@ -48,9 +48,10 @@ celery.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     
-    # Result backend settings
-    result_expires=86400,  # Results expire after 24 hours
+    # Result backend settings - OPTIMIZED FOR FREE TIER
+    result_expires=7200,  # 2 hours (saves Redis memory)
     result_persistent=True,
+    result_compression='gzip',  # Compress results to save Redis space
     
     # Task routing
     task_default_queue='default',

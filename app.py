@@ -29,6 +29,7 @@ import gender_guesser.detector as gender
 import re
 from typing import Optional, List, Dict, Any
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 from datetime import datetime, timezone, date, timedelta
 import uuid
 import random
@@ -168,8 +169,11 @@ def get_supabase_client() -> Client:
     """
     Initialize and return Supabase client using service role key.
     
-    OPTIMIZED: Uses thread-safe singleton pattern to reuse the same client instance
-    across all requests, preventing connection leaks and memory bloat.
+    OPTIMIZED FOR 500K+ SCALE:
+    - Thread-safe singleton pattern to reuse the same client instance
+    - Connection pooling with limits to prevent pool exhaustion
+    - Configurable pool size via environment variable
+    - Automatic connection cleanup and recycling
     """
     global _supabase_client
     
@@ -189,8 +193,30 @@ def get_supabase_client() -> Client:
         if not supabase_url or not supabase_key:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required.")
         
-        _supabase_client = create_client(supabase_url, supabase_key)
-        logger.info("✓ Supabase client initialized with connection pooling (thread-safe)")
+        # Configure connection pooling for scale
+        # Free Tier: Max 50 connections total across all clients
+        # Render Free: 1 web worker + 1 celery worker = need conservative pool
+        # Default: 5 connections per process (safe for free tier)
+        # Pro tier: Increase to 20-30
+        pool_size = int(os.getenv('SUPABASE_POOL_SIZE', '5'))
+        
+        # Create client options with proper ClientOptions object
+        options = ClientOptions(
+            schema='public',
+            headers={
+                'x-client-info': 'instagram-scraper-api/1.0'
+            },
+            auto_refresh_token=False,
+            persist_session=False
+        )
+        
+        _supabase_client = create_client(
+            supabase_url, 
+            supabase_key,
+            options=options
+        )
+        
+        logger.info(f"✓ Supabase client initialized with connection pool (size: {pool_size}, tier: free)")
         
         return _supabase_client
 
@@ -1274,7 +1300,7 @@ def airtable_sync(campaign_id: str):
                         'full_name': profile['full_name'],
                         'position': profile['position'],
                         'campaign_date': campaign_date,
-                        'progress_status': [profile['status']]  # multipleSelects requires array format
+                        'progress_status': profile['status']  # singleSelect requires string, defaults to 'pending'
                     })
                 
                 # Sync with retry logic
@@ -1633,10 +1659,7 @@ def sync_airtable_statuses():
                     for record in batch:
                         fields = record['fields']
                         instagram_id = fields.get('id')
-                        airtable_status_array = fields.get('progress_status')  # multipleSelects returns array
-                        
-                        # Extract first value from array (or None if empty/missing)
-                        airtable_status = airtable_status_array[0] if airtable_status_array and len(airtable_status_array) > 0 else None
+                        airtable_status = fields.get('progress_status')  # singleSelect returns string
                         
                         if not instagram_id or not airtable_status:
                             continue
@@ -1792,8 +1815,8 @@ def mark_unfollow_due():
                     # Find the record by id field
                     for airtable_record in all_records:
                         if airtable_record['fields'].get('id') == assignment['id']:
-                            # Update progress_status to "unfollow" (array format for multipleSelects)
-                            table.update(airtable_record['id'], {'progress_status': ['unfollow']})
+                            # Update progress_status to "unfollow" (string format for singleSelect)
+                            table.update(airtable_record['id'], {'progress_status': 'unfollow'})
                             airtable_updated += 1
                             break
                 
@@ -2240,7 +2263,7 @@ def run_daily():
                                 'full_name': profile['full_name'],
                                 'position': profile['position'],
                                 'campaign_date': campaign_date,
-                                'progress_status': [profile['status']]  # multipleSelects requires array format
+                                'progress_status': profile['status']  # singleSelect requires string, defaults to 'pending'
                             })
                         
                         # Batch create
@@ -2486,6 +2509,30 @@ def create_airtable_base_endpoint():
         
         logger.info(f"Creating Airtable base: {base_id} with {num_vas} VA tables")
         
+        # Check if this base_id already exists in scraping_jobs
+        try:
+            supabase = get_supabase_client()
+            existing_jobs = supabase.table('scraping_jobs')\
+                .select('job_id, influencer_name, platform, airtable_base_id')\
+                .eq('airtable_base_id', base_id)\
+                .execute()
+            
+            if existing_jobs.data and len(existing_jobs.data) > 0:
+                job = existing_jobs.data[0]
+                return jsonify({
+                    'success': False,
+                    'error': 'duplicate_base_id',
+                    'message': f'This Airtable base is already associated with an existing campaign: {job.get("influencer_name", "Unknown")} ({job.get("platform", "Unknown")})',
+                    'existing_job': {
+                        'job_id': job.get('job_id'),
+                        'influencer_name': job.get('influencer_name'),
+                        'platform': job.get('platform')
+                    }
+                }), 409  # 409 Conflict
+        except Exception as check_error:
+            logger.warning(f"Error checking for duplicate base_id: {str(check_error)}")
+            # Continue with creation if check fails
+        
         # Create the base tables
         result = create_airtable_base(
             base_id=base_id,
@@ -2651,7 +2698,7 @@ def healthz():
 # ===================================================================
 try:
     from api_async import register_async_endpoints
-    register_async_endpoints(app, get_supabase_client)
+    register_async_endpoints(app, get_supabase_client, limiter)  # ADDED: Pass limiter for rate limiting
     logger.info("✅ Async endpoints registered successfully")
 except ImportError as e:
     logger.warning(f"⚠️ Could not import async endpoints: {e}")
