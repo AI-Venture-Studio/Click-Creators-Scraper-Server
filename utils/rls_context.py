@@ -5,6 +5,9 @@ This module provides utilities to set and manage base_id context for RLS policie
 The base_id is passed to Supabase via JWT claims or custom headers, allowing
 RLS policies to filter data per tenant.
 
+IMPORTANT: base_id must ALWAYS be explicitly set. No default fallback is provided
+to ensure proper multi-tenant data isolation.
+
 Usage:
     # In Flask request handler
     from utils.rls_context import set_rls_context, get_rls_context
@@ -39,22 +42,39 @@ def set_rls_context(base_id: str) -> None:
     
     Args:
         base_id: The base_id to use for RLS filtering
+        
+    Raises:
+        ValueError: If base_id is invalid or empty
     """
     if not base_id or not isinstance(base_id, str):
-        raise ValueError(f"Invalid base_id: {base_id}")
+        raise ValueError(f"Invalid base_id: {base_id}. base_id must be a non-empty string.")
     
     g.setdefault(RLS_CONTEXT_KEY, base_id)
     logger.debug(f"RLS context set to base_id={base_id}")
 
 
-def get_rls_context() -> str:
+def get_rls_context(required: bool = True) -> Optional[str]:
     """
     Get the current base_id from RLS context.
     
+    Args:
+        required: If True, raises ValueError when base_id is not set
+    
     Returns:
-        str: The current base_id, or 'default_instagram' if not set
+        str: The current base_id, or None if not set and not required
+        
+    Raises:
+        ValueError: If required=True and base_id is not set in context
     """
-    return g.get(RLS_CONTEXT_KEY, 'default_instagram')
+    base_id = g.get(RLS_CONTEXT_KEY)
+    
+    if not base_id and required:
+        logger.error("RLS context (base_id) is not set but is required")
+        raise ValueError(
+            "RLS context not set. base_id must be set via set_rls_context() before accessing data."
+        )
+    
+    return base_id
 
 
 def clear_rls_context() -> None:

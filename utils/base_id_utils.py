@@ -2,10 +2,12 @@
 Multi-tenant base_id utility functions.
 
 This module provides helper functions for:
-1. Extracting base_id from request headers/body
-2. Providing default base_id for backward compatibility
-3. Validating base_id format
-4. Scoping queries to specific base_id
+1. Extracting base_id from request headers/body (REQUIRED)
+2. Validating base_id format
+3. Scoping queries to specific base_id
+
+IMPORTANT: base_id must ALWAYS be provided explicitly via headers or request body.
+No default fallback is provided to ensure proper multi-tenant isolation.
 """
 
 import logging
@@ -15,17 +17,22 @@ from flask import request
 logger = logging.getLogger(__name__)
 
 
-def get_base_id_from_request() -> str:
+def get_base_id_from_request(required: bool = True) -> Optional[str]:
     """
-    Extract base_id from request with fallback to default.
+    Extract base_id from request headers or body.
     
     Priority order:
     1. X-Base-Id header
     2. base_id field in JSON body
-    3. Default: 'default_instagram' (for backward compatibility)
+    
+    Args:
+        required: If True, raises ValueError when base_id is missing
     
     Returns:
-        str: The base_id to use for this request
+        str: The base_id from the request, or None if not found and not required
+        
+    Raises:
+        ValueError: If required=True and base_id is not provided
     """
     try:
         # Check header first (preferred for multi-tenant routing)
@@ -44,13 +51,24 @@ def get_base_id_from_request() -> str:
         except Exception as e:
             logger.debug(f"Could not parse JSON body for base_id: {e}")
         
-        # Fallback to default for backward compatibility
-        logger.debug("No base_id specified, using default: 'default_instagram'")
-        return 'default_instagram'
+        # No base_id found
+        if required:
+            logger.error("base_id is required but was not provided in headers or request body")
+            raise ValueError(
+                "base_id is required. Please provide it via 'X-Base-Id' header or 'base_id' in request body."
+            )
         
+        logger.warning("No base_id specified in request")
+        return None
+        
+    except ValueError:
+        # Re-raise ValueError for missing required base_id
+        raise
     except Exception as e:
-        logger.warning(f"Error extracting base_id from request: {e}")
-        return 'default_instagram'
+        logger.error(f"Error extracting base_id from request: {e}")
+        if required:
+            raise ValueError(f"Error extracting base_id: {str(e)}")
+        return None
 
 
 def ensure_base_id(data: Optional[Dict[str, Any]], base_id: Optional[str] = None) -> Dict[str, Any]:
@@ -113,7 +131,6 @@ def validate_base_id(base_id: str) -> bool:
     Validate base_id format.
     
     Airtable base IDs typically follow pattern: app[alphanumeric]
-    Our default is: 'default_instagram'
     
     Args:
         base_id: Base ID to validate
@@ -126,10 +143,6 @@ def validate_base_id(base_id: str) -> bool:
     
     base_id = base_id.strip()
     
-    # Allow our default placeholder
-    if base_id == 'default_instagram':
-        return True
-    
     # Airtable base IDs start with 'app' followed by alphanumeric
     if base_id.startswith('app') and len(base_id) > 3 and base_id[3:].replace('_', '').isalnum():
         return True
@@ -137,14 +150,69 @@ def validate_base_id(base_id: str) -> bool:
     return False
 
 
-def get_default_base_id() -> str:
+def get_va_table_count(base_id: str, supabase_client, airtable_token: Optional[str] = None) -> int:
     """
-    Get the default base_id for backward compatibility.
+    Dynamically get the number of VA tables for a given base_id.
     
+    This function checks:
+    1. Supabase scraping_jobs table for num_vas configuration
+    2. If not found, queries Airtable base schema to count Daily_Outreach_Table_XX tables
+    3. Falls back to environment variable NUM_VA_TABLES if both fail
+    
+    Args:
+        base_id: The Airtable base ID
+        supabase_client: Initialized Supabase client
+        airtable_token: Optional Airtable API token (for schema inspection)
+        
     Returns:
-        str: 'default_instagram'
+        int: Number of VA tables configured for this base
     """
-    return 'default_instagram'
+    import os
+    from pyairtable import Api
+    
+    logger.info(f"[get_va_table_count] Fetching VA table count for base_id: {base_id}")
+    
+    try:
+        # Strategy 1: Check scraping_jobs table in Supabase
+        result = supabase_client.table('scraping_jobs')\
+            .select('num_vas, airtable_base_id')\
+            .eq('airtable_base_id', base_id)\
+            .limit(1)\
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            num_vas = result.data[0].get('num_vas')
+            if num_vas and isinstance(num_vas, int) and num_vas > 0:
+                logger.info(f"[get_va_table_count] Found num_vas={num_vas} in scraping_jobs table")
+                return num_vas
+    
+    except Exception as e:
+        logger.warning(f"[get_va_table_count] Could not query scraping_jobs: {e}")
+    
+    # Strategy 2: Query Airtable base schema directly
+    if airtable_token:
+        try:
+            airtable = Api(airtable_token)
+            base = airtable.base(base_id)
+            schema = base.schema()
+            
+            # Count tables matching pattern Daily_Outreach_Table_XX
+            va_table_count = 0
+            for table in schema.tables:
+                if table.name.startswith('Daily_Outreach_Table_'):
+                    va_table_count += 1
+            
+            if va_table_count > 0:
+                logger.info(f"[get_va_table_count] Found {va_table_count} VA tables in Airtable schema")
+                return va_table_count
+                
+        except Exception as e:
+            logger.warning(f"[get_va_table_count] Could not query Airtable schema: {e}")
+    
+    # Strategy 3: Fallback to environment variable
+    fallback = int(os.getenv('NUM_VA_TABLES', 80))
+    logger.warning(f"[get_va_table_count] Using fallback NUM_VA_TABLES={fallback}")
+    return fallback
 
 
 class BaseIdContext:

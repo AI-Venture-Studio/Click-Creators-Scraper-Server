@@ -16,7 +16,7 @@ from tasks import (
     ingest_profiles_batch,
     daily_pipeline_orchestrator
 )
-from utils.base_id_utils import get_base_id_from_request, validate_base_id, get_default_base_id
+from utils.base_id_utils import get_base_id_from_request, validate_base_id
 
 logger = logging.getLogger(__name__)
 

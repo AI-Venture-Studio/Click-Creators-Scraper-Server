@@ -38,7 +38,7 @@ import traceback
 
 # Import utility modules
 from utils.airtable_creator import AirtableCreator, create_airtable_base
-from utils.base_id_utils import get_base_id_from_request, ensure_base_id, ensure_base_id_list, validate_base_id
+from utils.base_id_utils import get_base_id_from_request, ensure_base_id, ensure_base_id_list, validate_base_id, get_va_table_count
 from utils.rls_context import set_rls_context, get_rls_context
 
 # Load environment variables from .env file
@@ -86,7 +86,7 @@ CORS(app, resources={
     r"/api/*": {
         "origins": allowed_origins,
         "methods": ["GET", "POST"],
-        "allow_headers": ["Content-Type", "X-API-Key"]
+        "allow_headers": ["Content-Type", "X-API-Key", "X-Base-Id"]
     }
 })
 
@@ -115,25 +115,43 @@ def setup_rls_context():
     
     Extracts base_id from request headers/body and sets it in the RLS context,
     which is then used by Supabase RLS policies to filter data per tenant.
+    
+    Skips RLS setup for:
+    - OPTIONS requests (CORS preflight)
+    - Health check endpoints (/, /health)
+    - Static file requests
     """
+    # Skip RLS setup for OPTIONS requests (CORS preflight)
+    if request.method == 'OPTIONS':
+        return
+    
+    # Skip RLS setup for health check and root endpoints
+    if request.path in ['/', '/health', '/favicon.ico']:
+        return
+    
     try:
-        # Extract base_id from request (uses priority: header > body > default)
-        base_id = get_base_id_from_request()
+        # Extract base_id from request (uses priority: header > body)
+        # required=False allows requests without base_id to proceed
+        # Individual endpoints can validate if they need it
+        base_id = get_base_id_from_request(required=False)
         
-        # Validate base_id format
-        if not validate_base_id(base_id):
-            logger.warning(f"Invalid base_id format in request: {base_id}")
-            # Still set it (validation error will be caught later in endpoint)
-        
-        # Set RLS context for this request
-        set_rls_context(base_id)
-        
-        logger.debug(f"RLS context initialized for base_id={base_id}")
+        # Only set RLS context if base_id is provided
+        if base_id:
+            # Validate base_id format
+            if not validate_base_id(base_id):
+                logger.warning(f"Invalid base_id format in request: {base_id}")
+                # Still set it (validation error will be caught later in endpoint)
+            
+            # Set RLS context for this request
+            set_rls_context(base_id)
+            
+            logger.debug(f"RLS context initialized for base_id={base_id}")
+        else:
+            logger.debug(f"No base_id provided for {request.method} {request.path}")
         
     except Exception as e:
         logger.error(f"Error setting up RLS context: {e}")
-        # Default to 'default_instagram' if any error
-        set_rls_context('default_instagram')
+        # Continue without RLS context - individual endpoints will validate if needed
 
 
 logger.info("✓ RLS context setup enabled for multi-tenant isolation")
@@ -465,6 +483,27 @@ def process_accounts(accounts: list, target_gender: str = "male", max_count_per_
     }
 
 
+# ============================================================================
+# HEALTH CHECK ENDPOINTS (no base_id required)
+# ============================================================================
+
+@app.route('/', methods=['GET'])
+def root():
+    """
+    Root endpoint for basic health checks and uptime monitoring.
+    Does not require base_id authentication.
+    """
+    return jsonify({
+        'status': 'ok',
+        'service': 'Instagram Scraper API',
+        'version': '1.0.0'
+    }), 200
+
+
+# ============================================================================
+# API ENDPOINTS (base_id required via before_request handler)
+# ============================================================================
+
 @app.route('/api/scrape-followers', methods=['POST'])
 def scrape_followers_api():
     """
@@ -771,8 +810,14 @@ def daily_selection():
             profiles_per_table = DEFAULT_PROFILES_PER_TABLE
             print(f"⚠️ WARNING: Client did not send profiles_per_table, using fallback: {profiles_per_table}")
         
-        # Calculate target count: NUM_VA_TABLES * profiles_per_table
-        num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Get number of VA tables dynamically from database/Airtable
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        num_va_tables = get_va_table_count(base_id, supabase, airtable_token)
+        
+        # Calculate target count: num_va_tables * profiles_per_table
         target_count = num_va_tables * profiles_per_table
         
         # Get campaign date (default to today)
@@ -783,10 +828,7 @@ def daily_selection():
             campaign_date_obj = date.today()
         
         print(f"Starting daily selection for {campaign_date_obj} with base_id={base_id}...")
-        print(f"Target: {target_count} profiles")
-        
-        # Initialize Supabase client
-        supabase = get_supabase_client()
+        print(f"Target: {target_count} profiles ({num_va_tables} VA tables × {profiles_per_table} profiles/table)")
         
         # Step 1: Create a new campaign with base_id
         campaign_id = str(uuid.uuid4())
@@ -796,6 +838,7 @@ def daily_selection():
             'campaign_date': campaign_date_obj.isoformat(),
             'total_assigned': 0,
             'base_id': base_id,
+            'airtable_base_id': base_id,  # Store the Airtable base ID (same as base_id)
             'status': False,  # Default to False (failed), will update to True (success) after Airtable sync
             'created_at': datetime.now(timezone.utc).isoformat()
         }).execute()
@@ -927,8 +970,12 @@ def distribute_campaign(campaign_id: str):
                 'error': f'Invalid base_id format: {base_id}'
             }), 400
         
-        # Get configuration from environment variables
-        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
+        # Initialize Supabase client
+        supabase = get_supabase_client()
+        
+        # Get number of VA tables dynamically from database/Airtable
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        num_va_tables = get_va_table_count(base_id, supabase, airtable_token)
         
         # Get profiles_per_table from request body (should be from client's NEXT_PUBLIC_PROFILES_PER_TABLE)
         data = request.get_json() or {}
@@ -948,10 +995,7 @@ def distribute_campaign(campaign_id: str):
             print(f"⚠️ WARNING: Client did not send profiles_per_table, using fallback: {profiles_per_table}")
 
         print(f"Starting distribution for campaign {campaign_id} with base_id={base_id}...")
-        print(f"Configuration: {num_va_tables} VA tables, {profiles_per_table} profiles per table")
-        
-        # Initialize Supabase client
-        supabase = get_supabase_client()
+        print(f"Configuration: {num_va_tables} VA tables (dynamic), {profiles_per_table} profiles per table")
         
         # Step 1: Verify campaign exists (scoped to base_id)
         campaign = supabase.table('campaigns')\
@@ -1022,10 +1066,12 @@ def distribute_campaign(campaign_id: str):
                     print(f"⚠ Reached maximum VA tables ({num_va_tables}), stopping distribution")
                     break
         
-        print(f"✓ Distributed {distributed_count} profiles across {current_table if current_position == 1 else current_table} VA tables")
-        
         # Calculate actual distribution stats
-        tables_used = current_table if current_position == 1 else current_table
+        # If current_position is 1, we just incremented to a new table but haven't used it yet
+        # So the actual tables used is current_table - 1
+        tables_used = current_table - 1 if current_position == 1 else current_table
+        
+        print(f"✓ Distributed {distributed_count} profiles across {tables_used} VA tables")
         
         logger.info(f"Distribution complete for base_id={base_id}, campaign_id={campaign_id}: {distributed_count} profiles distributed across {tables_used} tables")
         
@@ -1087,9 +1133,44 @@ def airtable_sync(campaign_id: str):
                 'error': f'Invalid base_id format: {base_id}'
             }), 400
         
-        # Get configuration from environment variables
-        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
-        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        # Initialize clients
+        supabase = get_supabase_client()
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        airtable = get_airtable_client()
+        
+        # Get number of VA tables dynamically from database/Airtable
+        num_va_tables = get_va_table_count(base_id, supabase, airtable_token)
+        
+        # Get Airtable base ID from request body or campaign metadata
+        # Use silent=True to prevent error when no JSON body is sent
+        data = request.get_json(silent=True) or {}
+        airtable_base_id = data.get('airtable_base_id')
+        
+        # If not provided in request, try to fetch from campaign metadata in Supabase
+        if not airtable_base_id:
+            try:
+                campaign = supabase.table('campaigns')\
+                    .select('airtable_base_id')\
+                    .eq('campaign_id', campaign_id)\
+                    .eq('base_id', base_id)\
+                    .single()\
+                    .execute()
+                
+                if campaign.data and campaign.data.get('airtable_base_id'):
+                    airtable_base_id = campaign.data['airtable_base_id']
+                    logger.info(f"Retrieved Airtable base ID from campaign metadata: {airtable_base_id}")
+                else:
+                    logger.warning(f"No Airtable base ID found in campaign {campaign_id}")
+            except Exception as e:
+                logger.error(f"Error fetching Airtable base ID from campaign: {str(e)}")
+        
+        # Validate that we have an Airtable base ID
+        if not airtable_base_id:
+            return jsonify({
+            'success': False,
+            'error': 'Missing Airtable base ID. Please provide "airtable_base_id" in request body or ensure campaign has base ID configured.'
+            }), 400
+        
         
         if not airtable_base_id:
             return jsonify({
@@ -1098,11 +1179,7 @@ def airtable_sync(campaign_id: str):
             }), 500
         
         print(f"Starting Airtable sync for campaign {campaign_id} with base_id={base_id}...")
-        print(f"Configuration: {num_va_tables} VA tables, base ID: {airtable_base_id}")
-        
-        # Initialize clients
-        supabase = get_supabase_client()
-        airtable = get_airtable_client()
+        print(f"Configuration: {num_va_tables} VA tables (dynamic), base ID: {airtable_base_id}")
         
         # Step 1: Verify campaign exists and fetch campaign_date (scoped to base_id)
         campaign = supabase.table('campaigns')\
@@ -1197,7 +1274,7 @@ def airtable_sync(campaign_id: str):
                         'full_name': profile['full_name'],
                         'position': profile['position'],
                         'campaign_date': campaign_date,
-                        'progress_status': profile['status']  # Map Supabase 'status' to Airtable 'progress_status'
+                        'progress_status': [profile['status']]  # multipleSelects requires array format
                     })
                 
                 # Sync with retry logic
@@ -1513,21 +1590,28 @@ def sync_airtable_statuses():
     }
     """
     try:
-        # Get configuration
-        num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
-        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
         
-        if not airtable_base_id:
+        if not validate_base_id(base_id):
             return jsonify({
                 'success': False,
-                'error': 'AIRTABLE_BASE_ID environment variable not set'
-            }), 500
-        
-        print("Starting Airtable → Supabase status sync...")
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
         
         # Initialize clients
         supabase = get_supabase_client()
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
         airtable = get_airtable_client()
+        
+        # Get number of VA tables dynamically
+        num_va_tables = get_va_table_count(base_id, supabase, airtable_token)
+        
+        # Get Airtable base ID - use base_id parameter as the Airtable base ID
+        airtable_base_id = base_id
+        
+        print("Starting Airtable → Supabase status sync...")
+        print(f"Base ID: {airtable_base_id}, VA tables: {num_va_tables}")
         
         synced_count = 0
         errors = []
@@ -1549,7 +1633,10 @@ def sync_airtable_statuses():
                     for record in batch:
                         fields = record['fields']
                         instagram_id = fields.get('id')
-                        airtable_status = fields.get('progress_status')  # Use progress_status field
+                        airtable_status_array = fields.get('progress_status')  # multipleSelects returns array
+                        
+                        # Extract first value from array (or None if empty/missing)
+                        airtable_status = airtable_status_array[0] if airtable_status_array and len(airtable_status_array) > 0 else None
                         
                         if not instagram_id or not airtable_status:
                             continue
@@ -1620,20 +1707,25 @@ def mark_unfollow_due():
     }
     """
     try:
-        # Get configuration
-        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
         
-        if not airtable_base_id:
+        if not validate_base_id(base_id):
             return jsonify({
                 'success': False,
-                'error': 'AIRTABLE_BASE_ID environment variable not set'
-            }), 500
-        
-        print("Starting 7-day unfollow marking...")
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
         
         # Initialize clients
         supabase = get_supabase_client()
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
         airtable = get_airtable_client()
+        
+        # Get Airtable base ID - use base_id parameter
+        airtable_base_id = base_id
+        
+        print("Starting 7-day unfollow marking...")
+        print(f"Base ID: {airtable_base_id}")
         
         # Calculate 7 days ago
         seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -1700,8 +1792,8 @@ def mark_unfollow_due():
                     # Find the record by id field
                     for airtable_record in all_records:
                         if airtable_record['fields'].get('id') == assignment['id']:
-                            # Update progress_status to "unfollow"
-                            table.update(airtable_record['id'], {'progress_status': 'unfollow'})
+                            # Update progress_status to "unfollow" (array format for multipleSelects)
+                            table.update(airtable_record['id'], {'progress_status': ['unfollow']})
                             airtable_updated += 1
                             break
                 
@@ -1752,20 +1844,25 @@ def delete_completed_after_delay():
     }
     """
     try:
-        # Get configuration
-        airtable_base_id = os.getenv('AIRTABLE_BASE_ID')
+        # Extract base_id with fallback to default
+        base_id = get_base_id_from_request()
         
-        if not airtable_base_id:
+        if not validate_base_id(base_id):
             return jsonify({
                 'success': False,
-                'error': 'AIRTABLE_BASE_ID environment variable not set'
-            }), 500
-        
-        print("Starting 24-hour completed record deletion...")
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
         
         # Initialize clients
         supabase = get_supabase_client()
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
         airtable = get_airtable_client()
+        
+        # Get Airtable base ID - use base_id parameter
+        airtable_base_id = base_id
+        
+        print("Starting 24-hour completed record deletion...")
+        print(f"Base ID: {airtable_base_id}")
         
         # Calculate 24 hours ago
         twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
@@ -1903,8 +2000,21 @@ def run_daily():
         print("=" * 70)
         print()
         
+        # Extract base_id
+        base_id = get_base_id_from_request()
+        
+        if not validate_base_id(base_id):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid base_id format: {base_id}'
+            }), 400
+        
         # Initialize Supabase client
         supabase = get_supabase_client()
+        airtable_token = os.getenv('AIRTABLE_ACCESS_TOKEN')
+        
+        # Get number of VA tables dynamically
+        num_va_tables = get_va_table_count(base_id, supabase, airtable_token)
         
         # Get configuration - profiles_per_table should come from request body
         # This endpoint is typically for testing/manual runs, so we use DEFAULT if not provided
@@ -1916,10 +2026,11 @@ def run_daily():
         else:
             print(f"⚠️ WARNING: Using default profiles_per_table: {profiles_per_table}")
         
-        # Calculate target count: NUM_VA_TABLES * profiles_per_table
-        num_va_tables = int(os.getenv('NUM_VA_TABLES', 80))
+        # Calculate target count: num_va_tables * profiles_per_table
         target_count = num_va_tables * profiles_per_table
         campaign_date_obj = date.today()
+        
+        print(f"Configuration: {num_va_tables} VA tables (dynamic) × {profiles_per_table} profiles = {target_count} total")
         
         # ===== STEP 1: DAILY SELECTION =====
         print("STEP 1: Daily Selection")
@@ -1933,6 +2044,9 @@ def run_daily():
                 'campaign_id': campaign_id,
                 'campaign_date': campaign_date_obj.isoformat(),
                 'total_assigned': 0,
+                'base_id': base_id,
+                'airtable_base_id': base_id,  # Store the Airtable base ID
+                'status': False,
                 'created_at': datetime.now(timezone.utc).isoformat()
             }).execute()
             
@@ -1942,6 +2056,7 @@ def run_daily():
             available_profiles = supabase.table('global_usernames')\
                 .select('id, username, full_name')\
                 .eq('used', False)\
+                .eq('base_id', base_id)\
                 .limit(target_count)\
                 .execute()
             
@@ -1966,6 +2081,7 @@ def run_daily():
                         'used_at': datetime.now(timezone.utc).isoformat()
                     })\
                     .eq('id', profile_id)\
+                    .eq('base_id', base_id)\
                     .execute()
             
             print(f"✓ Marked {total_selected} profiles as used")
@@ -1981,6 +2097,7 @@ def run_daily():
                     'id': profile['id'],
                     'username': profile['username'],
                     'full_name': profile['full_name'],
+                    'base_id': base_id,
                     'status': 'pending',
                     'assigned_at': datetime.now(timezone.utc).isoformat()
                 })
@@ -2009,13 +2126,14 @@ def run_daily():
         print("-" * 70)
         
         try:
-            num_va_tables = int(os.getenv('NUM_VA_TABLES', '80'))
+            # num_va_tables already calculated dynamically at the top
             # profiles_per_table already defined at the top from request body
             
             # Fetch unassigned profiles
             unassigned = supabase.table('daily_assignments')\
                 .select('assignment_id, id, username, full_name')\
                 .eq('campaign_id', campaign_id)\
+                .eq('base_id', base_id)\
                 .eq('va_table_number', 0)\
                 .execute()
             
@@ -2122,7 +2240,7 @@ def run_daily():
                                 'full_name': profile['full_name'],
                                 'position': profile['position'],
                                 'campaign_date': campaign_date,
-                                'progress_status': profile['status']  # Map Supabase 'status' to Airtable 'progress_status'
+                                'progress_status': [profile['status']]  # multipleSelects requires array format
                             })
                         
                         # Batch create

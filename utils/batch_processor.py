@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 def batch_insert_profiles(
     supabase: Client,
     profiles: List[Dict],
+    base_id: str,
     batch_size: int = 1000,
-    rate_limit_delay: float = 0.1,
-    base_id: str = 'default_instagram'
+    rate_limit_delay: float = 0.1
 ) -> Tuple[int, int, int]:
     """
     Insert profiles into Supabase using TRUE bulk inserts for maximum performance.
@@ -36,9 +36,9 @@ def batch_insert_profiles(
     Args:
         supabase: Supabase client instance
         profiles: List of profile dictionaries with id, username, full_name
+        base_id: Multi-tenant identifier for data isolation (REQUIRED)
         batch_size: Number of profiles to insert per batch (default: 1000)
         rate_limit_delay: Delay in seconds between batches (default: 0.1 = 100ms)
-        base_id: Multi-tenant identifier for data isolation (default: 'default_instagram')
         
     Returns:
         Tuple of (inserted_raw, added_to_global, skipped_existing)
