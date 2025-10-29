@@ -82,7 +82,12 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 
 # Apify (REQUIRED - Update these!)
 APIFY_API_KEY=your-apify-api-key
-APIFY_ACTOR_ID=your-actor-id
+
+# Platform-specific Apify Actor IDs (for multi-platform support)
+INSTAGRAM_APIFY_ACTOR_ID=your-instagram-actor-id
+TIKTOK_APIFY_ACTOR_ID=your-tiktok-actor-id
+THREADS_APIFY_ACTOR_ID=your-threads-actor-id
+X_APIFY_ACTOR_ID=your-x-actor-id
 
 # Airtable (REQUIRED - Update these!)
 AIRTABLE_ACCESS_TOKEN=your-airtable-token
@@ -101,7 +106,10 @@ EOF
     echo "  - SUPABASE_URL"
     echo "  - SUPABASE_SERVICE_ROLE_KEY"
     echo "  - APIFY_API_KEY"
-    echo "  - APIFY_ACTOR_ID"
+    echo "  - INSTAGRAM_APIFY_ACTOR_ID (Instagram scraping)"
+    echo "  - TIKTOK_APIFY_ACTOR_ID (TikTok scraping - optional)"
+    echo "  - THREADS_APIFY_ACTOR_ID (Threads scraping - optional)"
+    echo "  - X_APIFY_ACTOR_ID (X/Twitter scraping - optional)"
     echo "  - AIRTABLE_ACCESS_TOKEN"
     echo "  - AIRTABLE_BASE_ID"
     echo ""

@@ -103,29 +103,32 @@ def scrape_account_batch(
     target_gender: str = 'male',
     max_per_account: int = 5,
     batch_number: int = 1,
-    base_id: str = None  # ADDED: Multi-tenant isolation
+    base_id: str = None,  # Multi-tenant isolation
+    platform: str = 'instagram'  # ADDED: Platform support
 ) -> Dict[str, Any]:
     """
     Scrape a batch of accounts (max 50) and return filtered profiles.
     
-    OPTIMIZED FOR 500K+ SCALE WITH MULTI-TENANT SUPPORT:
+    OPTIMIZED FOR 500K+ SCALE WITH MULTI-TENANT & MULTI-PLATFORM SUPPORT:
     - RLS context set for tenant isolation
+    - Platform-aware scraping (Instagram, TikTok, Threads, X)
     - Retry logic for Apify failures
     - Memory-efficient processing
     
     Args:
         job_id: Unique job identifier
-        accounts: List of Instagram usernames (max 50)
+        accounts: List of account usernames (max 50)
         target_gender: Target gender filter ('male' or 'female')
         max_per_account: Max followers to scrape per account
         batch_number: Batch number for logging
         base_id: Multi-tenant identifier for RLS (REQUIRED)
+        platform: Social media platform (instagram, threads, tiktok, x)
         
     Returns:
         Dictionary with scraped and filtered profiles
     """
     try:
-        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraping {len(accounts)} accounts (base_id={base_id})")
+        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraping {len(accounts)} {platform} accounts (base_id={base_id})")
         
         # Set RLS context for multi-tenant isolation
         if base_id:
@@ -138,9 +141,9 @@ def scrape_account_batch(
         # Update job progress
         supabase = get_supabase_client()
         
-        # Step 1: Scrape followers
-        followers = scrape_followers(accounts, max_per_account)
-        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraped {len(followers)} followers")
+        # Step 1: Scrape followers (with platform support)
+        followers = scrape_followers(accounts, max_per_account, platform=platform)
+        logger.info(f"[Job {job_id}] Batch {batch_number}: Scraped {len(followers)} followers from {platform}")
         
         # Step 2: Detect gender
         followers_gender = detect_gender(followers)

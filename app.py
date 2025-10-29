@@ -236,66 +236,22 @@ def get_airtable_client() -> Api:
     return Api(airtable_token)
 
 
-def scrape_followers(accounts: list, max_count: int = 5) -> dict:
+def scrape_followers(accounts: list, max_count: int = 5, platform: str = 'instagram') -> dict:
     """
-    Handles API requests and Instagram scraping logic.
+    Wrapper function that delegates to the utility scraper module.
     
     Args:
-        accounts: A list of Instagram account usernames to scrape followers from.
+        accounts: A list of account usernames to scrape followers from.
         max_count: Maximum followers to scrape per account (default: 5).
+        platform: Platform to scrape ('instagram', 'tiktok', 'threads', 'x'). Defaults to 'instagram'.
         
     Returns:
         A dictionary mapping each account to their extracted followers data.
         Each follower entry contains username, full_name, follower_count, following_count, posts_count.
     """
-    # Initialize the ApifyClient with API token from environment variable
-    api_key = os.getenv('APIFY_API_KEY')
-    if not api_key:
-        raise ValueError("APIFY_API_KEY environment variable is required. Please set it in your .env file or environment.")
-    
-    client = ApifyClient(api_key)
-    
-    # Prepare the Actor input
-    run_input = {
-        "usernames": accounts,
-        "max_count": max_count,  # Use the provided max_count parameter
-    }
-    
-    # Run the Actor and wait for it to finish
-    actor_key = os.getenv('APIFY_ACTOR_ID')
-
-    if not actor_key:
-        raise ValueError("APIFY_ACTOR_ID environment variable is required. Please set it in your .env file or environment.")
-
-    run = client.actor(actor_key).call(run_input=run_input)
-    
-    # Fetch Actor results and store in a list
-    data = []
-    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-        data.append(item)
-    
-    # Create pandas DataFrame from the collected data
-    followers_df = pd.DataFrame(data)
-    
-    # Drop unnecessary columns to clean up the data
-    columns_to_drop = ['profile_pic_url', 'latest_story_ts', 'is_verified', 'is_private']
-    followers_df = followers_df.drop(columns=columns_to_drop, errors='ignore')
-    
-    # Convert DataFrame to dictionary format for easier processing
-    followers_dict = {}
-    for _, row in followers_df.iterrows():
-        follower_data = {
-            'username': row.get('username', ''),
-            'full_name': row.get('full_name') or row.get('fullname', ''),
-            'follower_count': row.get('follower_count', 0),
-            'following_count': row.get('following_count', 0),
-            'posts_count': row.get('posts_count', 0),
-            'id': row.get('id', row.get('username', ''))  # Use ID or fallback to username
-        }
-        # Use username as key for each follower
-        followers_dict[row.get('username', '')] = follower_data
-    
-    return followers_dict
+    # Import and use the utility scraper function which has all the platform-specific logic
+    from utils.scraper import scrape_followers as scraper_scrape_followers
+    return scraper_scrape_followers(accounts, max_count, platform=platform)
 
 
 def detect_gender(followers: dict) -> dict:
@@ -452,25 +408,27 @@ def filter_by_gender(followers_gender: dict, target_gender: str) -> dict:
     return filtered_followers
 
 
-def process_accounts(accounts: list, target_gender: str = "male", max_count_per_account: int = 5) -> dict:
+def process_accounts(accounts: list, target_gender: str = "male", max_count_per_account: int = 5, platform: str = "instagram") -> dict:
     """
     Orchestrates the entire workflow.
     
     Args:
-        accounts: List of Instagram usernames to scrape followers from.
+        accounts: List of social media usernames to scrape followers from.
         target_gender: Target gender to filter for ("male" or "female").
         max_count_per_account: Maximum followers to scrape per account.
+        platform: Social media platform to scrape from (default: "instagram").
         
     Returns:
         Dictionary with filtered followers data and summary statistics.
     """
-    print(f"Starting Instagram follower analysis for accounts: {accounts}")
+    platform_name = platform.capitalize()
+    print(f"Starting {platform_name} follower analysis for accounts: {accounts}")
     print(f"Target gender: {target_gender}")
     print(f"Max count per account: {max_count_per_account}")
     
     # Step 1: Scrape followers from specified accounts
     print("\n1. Scraping followers...")
-    followers = scrape_followers(accounts, max_count_per_account)
+    followers = scrape_followers(accounts, max_count_per_account, platform=platform)
     print(f"   Scraped {len(followers)} total followers")
     
     # Step 2: Detect gender for all followers
@@ -576,6 +534,7 @@ def scrape_followers_api():
         accounts = data['accounts']
         target_gender = data.get('targetGender', 'male')  # Default to male
         total_scrape_count = data.get('totalScrapeCount', None)  # User-defined total count
+        platform = data.get('platform', 'instagram')  # Default to instagram
         
         if not isinstance(accounts, list) or len(accounts) == 0:
             return jsonify({
@@ -608,8 +567,8 @@ def scrape_followers_api():
             per_account_count = 5
             print(f"No totalScrapeCount provided, using default per-account count: {per_account_count}")
         
-        # Process the accounts with computed per-account count
-        result = process_accounts(accounts, target_gender, per_account_count)
+        # Process the accounts with computed per-account count and platform
+        result = process_accounts(accounts, target_gender, per_account_count, platform)
         
         return jsonify({
             'success': True,

@@ -36,7 +36,7 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
     @limiter.limit("10 per hour") if limiter else (lambda f: f)
     def scrape_followers_async():
         """
-        ASYNC: Queue Instagram follower scraping job.
+        ASYNC: Queue follower scraping job for multi-platform support.
         
         RATE LIMITED: 10 requests per hour (expensive Apify operation at scale)
         
@@ -45,17 +45,21 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
             "accounts": ["username1", "username2", ...],
             "targetGender": "male" (optional, defaults to "male"),
             "totalScrapeCount": 150 (optional, total accounts to scrape),
+            "platform": "Instagram" (optional, defaults to "Instagram"),
             "base_id": "appXYZ123ABC" (optional, defaults to 'default_instagram')
         }
         
         OR pass base_id via header:
         X-Base-Id: appXYZ123ABC
         
+        Supported platforms: "Instagram", "TikTok", "Threads", "X"
+        
         Returns:
         {
             "success": true,
             "job_id": "uuid",
             "base_id": "appXYZ123ABC",
+            "platform": "instagram",
             "status_url": "/api/job-status/uuid",
             "results_url": "/api/job-results/uuid",
             "message": "Job queued successfully. Poll status_url for progress."
@@ -74,6 +78,17 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
             accounts = data['accounts']
             target_gender = data.get('targetGender', 'male')
             total_scrape_count = data.get('totalScrapeCount', None)
+            
+            # ADDED: Platform support with default to Instagram for backward compatibility
+            platform = data.get('platform', 'Instagram').lower()
+            
+            # Validate platform
+            valid_platforms = ['instagram', 'tiktok', 'threads', 'x']
+            if platform not in valid_platforms:
+                return jsonify({
+                    'success': False,
+                    'error': f'Invalid platform "{platform}". Must be one of: {", ".join(valid_platforms)}'
+                }), 400
             
             if not isinstance(accounts, list) or len(accounts) == 0:
                 return jsonify({
@@ -117,9 +132,9 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
             account_batches = [accounts[i:i + batch_size] for i in range(0, len(accounts), batch_size)]
             total_batches = len(account_batches)
             
-            logger.info(f"Creating job {job_id} with {total_batches} batches for base_id={base_id}")
+            logger.info(f"Creating {platform} job {job_id} with {total_batches} batches for base_id={base_id}")
             
-            # Insert job record with base_id
+            # Insert job record with base_id and platform
             supabase.table('scrape_jobs').insert({
                 'job_id': job_id,
                 'status': 'queued',
@@ -131,14 +146,15 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
                 'progress': 0.0,
                 'profiles_scraped': 0,
                 'base_id': base_id,
+                'platform': platform,  # ADDED: Platform support
                 'created_at': datetime.now(timezone.utc).isoformat()
             }).execute()
             
-            logger.info(f"Job {job_id} created, queueing tasks")
+            logger.info(f"Job {job_id} created, queueing {platform} scraping tasks")
             
             # Queue batch tasks using Celery chord pattern
             # All batches run in parallel, then aggregation runs after all complete
-            # FIXED: Pass base_id to all tasks for multi-tenant isolation
+            # FIXED: Pass base_id and platform to all tasks for multi-tenant & multi-platform support
             batch_tasks = []
             for i, batch in enumerate(account_batches, 1):
                 task = scrape_account_batch.s(
@@ -147,7 +163,8 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
                     target_gender=target_gender,
                     max_per_account=per_account_count,
                     batch_number=i,
-                    base_id=base_id  # ADDED: Multi-tenant isolation
+                    base_id=base_id,  # Multi-tenant isolation
+                    platform=platform  # ADDED: Platform support
                 )
                 batch_tasks.append(task)
             
@@ -166,16 +183,17 @@ def register_async_endpoints(app, get_supabase_client, limiter=None):
                 .eq('job_id', job_id)\
                 .execute()
             
-            logger.info(f"Job {job_id} queued successfully with {total_batches} batches for base_id={base_id}")
+            logger.info(f"Job {job_id} queued successfully with {total_batches} batches for {platform} (base_id={base_id})")
             
             return jsonify({
                 'success': True,
                 'job_id': job_id,
                 'base_id': base_id,
+                'platform': platform,  # ADDED: Include platform in response
                 'status_url': f'/api/job-status/{job_id}',
                 'results_url': f'/api/job-results/{job_id}',
                 'total_batches': total_batches,
-                'message': 'Job queued successfully. Poll status_url for progress.'
+                'message': f'{platform.capitalize()} scraping job queued successfully. Poll status_url for progress.'
             }), 202  # 202 Accepted
             
         except Exception as e:

@@ -1,29 +1,84 @@
 """
 Instagram scraping utilities using Apify.
+Multi-platform support: Instagram, TikTok, Threads, X
 """
 import os
 import logging
 import time
-from typing import Dict, List
+from typing import Dict, List, Literal
 import pandas as pd
 from apify_client import ApifyClient
 
 logger = logging.getLogger(__name__)
 
+# Type alias for platform
+Platform = Literal['instagram', 'threads', 'tiktok', 'x']
 
-def scrape_followers(accounts: List[str], max_count: int = 5, max_retries: int = 3) -> Dict[str, Dict]:
+
+def get_actor_id_for_platform(platform: str = 'instagram') -> str:
     """
-    Scrape Instagram followers from specified accounts using Apify with retry logic.
+    Get the appropriate Apify actor ID for the specified platform.
+    
+    Args:
+        platform: Social media platform (instagram, threads, tiktok, x)
+        
+    Returns:
+        Apify actor ID for the platform
+        
+    Raises:
+        ValueError: If platform is unsupported or actor ID not configured
+    """
+    # Normalize platform to lowercase
+    platform = platform.lower()
+    
+    # Map platform to environment variable
+    platform_env_map = {
+        'instagram': 'INSTAGRAM_APIFY_ACTOR_ID',
+        'threads': 'THREADS_APIFY_ACTOR_ID',
+        'tiktok': 'TIKTOK_APIFY_ACTOR_ID',
+        'x': 'X_APIFY_ACTOR_ID'
+    }
+    
+    # Fallback to legacy APIFY_ACTOR_ID for Instagram if specific one not set
+    if platform == 'instagram':
+        actor_id = os.getenv('INSTAGRAM_APIFY_ACTOR_ID') or os.getenv('APIFY_ACTOR_ID')
+    elif platform in platform_env_map:
+        actor_id = os.getenv(platform_env_map[platform])
+    else:
+        # Unknown platform - default to Instagram actor
+        logger.warning(f"Unknown platform '{platform}', defaulting to Instagram actor")
+        actor_id = os.getenv('INSTAGRAM_APIFY_ACTOR_ID') or os.getenv('APIFY_ACTOR_ID')
+    
+    if not actor_id:
+        raise ValueError(
+            f"Apify actor ID not configured for platform '{platform}'. "
+            f"Please set {platform_env_map.get(platform, 'APIFY_ACTOR_ID')} environment variable."
+        )
+    
+    logger.info(f"Using Apify actor {actor_id} for platform '{platform}'")
+    return actor_id
+
+
+def scrape_followers(
+    accounts: List[str], 
+    max_count: int = 5, 
+    max_retries: int = 3,
+    platform: str = 'instagram'
+) -> Dict[str, Dict]:
+    """
+    Scrape followers from specified social media accounts using Apify with retry logic.
     
     OPTIMIZED FOR 500K+ SCALE:
     - Exponential backoff retry for rate limiting
     - Handles Apify API failures gracefully
     - Automatic retry on network errors
+    - Multi-platform support (Instagram, TikTok, Threads, X)
     
     Args:
-        accounts: A list of Instagram account usernames to scrape followers from.
+        accounts: A list of account usernames to scrape followers from.
         max_count: Maximum followers to scrape per account (default: 5).
         max_retries: Maximum number of retry attempts (default: 3).
+        platform: Social media platform to scrape from (default: 'instagram').
         
     Returns:
         A dictionary mapping each account to their extracted followers data.
@@ -33,7 +88,7 @@ def scrape_followers(accounts: List[str], max_count: int = 5, max_retries: int =
         ValueError: If required environment variables are missing.
         Exception: If Apify scraping fails after all retries.
     """
-    logger.info(f"Starting scrape for {len(accounts)} accounts, max {max_count} followers each")
+    logger.info(f"Starting {platform} scrape for {len(accounts)} accounts, max {max_count} followers each")
     
     # Initialize the ApifyClient with API token from environment variable
     api_key = os.getenv('APIFY_API_KEY')
@@ -42,18 +97,49 @@ def scrape_followers(accounts: List[str], max_count: int = 5, max_retries: int =
     
     client = ApifyClient(api_key)
     
-    # Prepare the Actor input
-    run_input = {
-        "usernames": accounts,
-        "max_count": max_count,
-    }
+    # Get platform-specific actor ID
+    actor_key = get_actor_id_for_platform(platform)
     
-    # Run the Actor and wait for it to finish
-    actor_key = os.getenv('APIFY_ACTOR_ID')
-    if not actor_key:
-        raise ValueError("APIFY_ACTOR_ID environment variable is required. Please set it in your .env file or environment.")
+    # Prepare the Actor input based on platform
+    # Different Apify actors expect different input formats
+    if platform.lower() == 'tiktok':
+        # TikTok actor expects startUrls with full profile URLs
+        # Convert usernames to TikTok profile URLs
+        tiktok_urls = []
+        for username in accounts:
+            # Add @ prefix if not present and convert to URL
+            clean_username = username.strip()
+            if not clean_username.startswith('@'):
+                clean_username = f'@{clean_username}'
+            # Create full TikTok URL
+            profile_url = f'https://www.tiktok.com/{clean_username}'
+            tiktok_urls.append({"url": profile_url})
+        
+        run_input = {
+            "startUrls": tiktok_urls,
+            "resultsPerPage": max_count,
+        }
+        logger.info(f"TikTok URLs to scrape: {[u['url'] for u in tiktok_urls]}")
+    elif platform.lower() == 'threads':
+        # Threads actor - adjust as needed based on actual actor
+        run_input = {
+            "usernames": accounts,
+            "max_count": max_count,
+        }
+    elif platform.lower() == 'x':
+        # X/Twitter actor - adjust as needed based on actual actor
+        run_input = {
+            "usernames": accounts,
+            "max_count": max_count,
+        }
+    else:
+        # Instagram (default)
+        run_input = {
+            "usernames": accounts,
+            "max_count": max_count,
+        }
 
-    logger.info(f"Calling Apify actor {actor_key}")
+    logger.info(f"Calling Apify actor {actor_key} for platform '{platform}'")
     
     # Retry loop with exponential backoff
     last_error = None
@@ -108,29 +194,69 @@ def scrape_followers(accounts: List[str], max_count: int = 5, max_retries: int =
     # Create pandas DataFrame from the collected data
     followers_df = pd.DataFrame(data)
     
-    # Drop unnecessary columns to clean up the data
-    columns_to_drop = ['profile_pic_url', 'latest_story_ts', 'is_verified', 'is_private']
+    # Drop unnecessary columns to clean up the data (platform-specific)
+    if platform.lower() == 'tiktok':
+        columns_to_drop = ['avatar', 'coverImage', 'region', 'language', 'hasEmail', 'hasPhone', 'verified']
+    else:
+        columns_to_drop = ['profile_pic_url', 'latest_story_ts', 'is_verified', 'is_private']
     followers_df = followers_df.drop(columns=columns_to_drop, errors='ignore')
     
     # Convert DataFrame to dictionary format for easier processing
     # Process row by row to minimize memory footprint
+    # Normalize field names across different platforms
     followers_dict = {}
     for _, row in followers_df.iterrows():
-        follower_data = {
-            'username': row.get('username', ''),
-            'full_name': row.get('full_name') or row.get('fullname', ''),
-            'follower_count': row.get('follower_count', 0),
-            'following_count': row.get('following_count', 0),
-            'posts_count': row.get('posts_count', 0),
-            'id': row.get('id', row.get('username', ''))
-        }
+        # Platform-specific field mapping
+        if platform.lower() == 'tiktok':
+            # TikTok uses: nickname, followers, following, videos
+            follower_data = {
+                'username': row.get('username', ''),
+                'full_name': row.get('nickname', ''),  # TikTok uses 'nickname'
+                'follower_count': row.get('followers', 0),  # TikTok uses 'followers'
+                'following_count': row.get('following', 0),  # TikTok uses 'following'
+                'posts_count': row.get('videos', 0),  # TikTok uses 'videos'
+                'id': str(row.get('id', row.get('username', '')))  # Ensure ID is string
+            }
+        elif platform.lower() == 'threads':
+            # Threads likely uses similar fields to Instagram (adjust as needed)
+            follower_data = {
+                'username': row.get('username', ''),
+                'full_name': row.get('full_name') or row.get('fullname', ''),
+                'follower_count': row.get('follower_count', 0),
+                'following_count': row.get('following_count', 0),
+                'posts_count': row.get('posts_count', 0),
+                'id': row.get('id', row.get('username', ''))
+            }
+        elif platform.lower() == 'x':
+            # X/Twitter field mapping (adjust as needed based on actual actor response)
+            follower_data = {
+                'username': row.get('username', ''),
+                'full_name': row.get('name', ''),  # X uses 'name'
+                'follower_count': row.get('followers_count', 0),
+                'following_count': row.get('following_count', 0),
+                'posts_count': row.get('tweets_count', 0),
+                'id': row.get('id', row.get('username', ''))
+            }
+        else:
+            # Instagram (default)
+            follower_data = {
+                'username': row.get('username', ''),
+                'full_name': row.get('full_name') or row.get('fullname', ''),
+                'follower_count': row.get('follower_count', 0),
+                'following_count': row.get('following_count', 0),
+                'posts_count': row.get('posts_count', 0),
+                'id': row.get('id', row.get('username', ''))
+            }
+        
         # Use username as key for each follower
-        followers_dict[row.get('username', '')] = follower_data
+        username = follower_data['username']
+        if username:  # Only add if username exists
+            followers_dict[username] = follower_data
     
     # Clear DataFrame from memory
     del followers_df
     del data
     
-    logger.info(f"Processed {len(followers_dict)} unique followers")
+    logger.info(f"Processed {len(followers_dict)} unique followers from {platform}")
     return followers_dict
 

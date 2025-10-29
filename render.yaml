@@ -38,8 +38,15 @@ services:
         sync: false  # Set manually in Render dashboard
       - key: APIFY_API_KEY
         sync: false  # Set manually in Render dashboard
-      - key: APIFY_ACTOR_ID
+      # Platform-specific Apify Actor IDs (for multi-platform support)
+      - key: INSTAGRAM_APIFY_ACTOR_ID
         sync: false  # Set manually in Render dashboard
+      - key: TIKTOK_APIFY_ACTOR_ID
+        sync: false  # Set manually in Render dashboard (optional - TikTok scraping)
+      - key: THREADS_APIFY_ACTOR_ID
+        sync: false  # Set manually in Render dashboard (optional - Threads scraping)
+      - key: X_APIFY_ACTOR_ID
+        sync: false  # Set manually in Render dashboard (optional - X/Twitter scraping)
       - key: AIRTABLE_ACCESS_TOKEN
         sync: false  # Set manually in Render dashboard
       - key: AIRTABLE_BASE_ID

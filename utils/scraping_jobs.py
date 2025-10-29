@@ -32,6 +32,7 @@ class ScrapingJobsManager:
         platform: Platform,
         airtable_base_id: str,
         num_vas: Optional[int] = None,
+        base_id: Optional[str] = None,
         status: JobStatus = 'active'
     ) -> Optional[Dict]:
         """
@@ -42,19 +43,26 @@ class ScrapingJobsManager:
             platform: Social media platform (instagram, threads, tiktok, x)
             airtable_base_id: Airtable base ID for this job
             num_vas: Number of Virtual Assistants (optional)
+            base_id: Multi-tenant base identifier (optional)
             status: Job status (default: active)
             
         Returns:
             Created job data or None if failed
         """
         try:
-            response = supabase.table('scraping_jobs').insert({
+            job_data = {
                 'influencer_name': influencer_name,
-                'platform': platform,
+                'platform': platform.lower(),  # Normalize to lowercase
                 'airtable_base_id': airtable_base_id,
                 'num_vas': num_vas,
                 'status': status
-            }).execute()
+            }
+            
+            # Add base_id if provided
+            if base_id:
+                job_data['base_id'] = base_id
+            
+            response = supabase.table('scraping_jobs').insert(job_data).execute()
             
             return response.data[0] if response.data else None
         except Exception as e:
