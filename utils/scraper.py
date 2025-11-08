@@ -103,23 +103,27 @@ def scrape_followers(
     # Prepare the Actor input based on platform
     # Different Apify actors expect different input formats
     if platform.lower() == 'tiktok':
-        # TikTok actor expects startUrls with full profile URLs
-        # Convert usernames to TikTok profile URLs
-        tiktok_urls = []
+        # TikTok actor expects: {"numFollowers": 100, "usernames": ["username1", "username2"]}
+        # Clean usernames: remove @ prefix and any URL parts
+        clean_usernames = []
         for username in accounts:
-            # Add @ prefix if not present and convert to URL
             clean_username = username.strip()
-            if not clean_username.startswith('@'):
-                clean_username = f'@{clean_username}'
-            # Create full TikTok URL
-            profile_url = f'https://www.tiktok.com/{clean_username}'
-            tiktok_urls.append({"url": profile_url})
+            # Remove @ prefix if present
+            if clean_username.startswith('@'):
+                clean_username = clean_username[1:]
+            # Remove URL prefix if it's a full TikTok URL
+            if 'tiktok.com/' in clean_username:
+                # Extract username from URL like https://www.tiktok.com/@username
+                clean_username = clean_username.split('tiktok.com/')[-1]
+                if clean_username.startswith('@'):
+                    clean_username = clean_username[1:]
+            clean_usernames.append(clean_username)
         
         run_input = {
-            "startUrls": tiktok_urls,
-            "resultsPerPage": max_count,
+            "usernames": clean_usernames,
+            "numFollowers": max_count,
         }
-        logger.info(f"TikTok URLs to scrape: {[u['url'] for u in tiktok_urls]}")
+        logger.info(f"TikTok usernames to scrape: {clean_usernames}")
     elif platform.lower() == 'threads':
         # Threads actor - adjust as needed based on actual actor
         run_input = {
@@ -200,7 +204,7 @@ def scrape_followers(
     
     # Drop unnecessary columns to clean up the data (platform-specific)
     if platform.lower() == 'tiktok':
-        columns_to_drop = ['avatar', 'coverImage', 'region', 'language', 'hasEmail', 'hasPhone', 'verified']
+        columns_to_drop = ['avatar', 'coverImage', 'language', 'hasEmail', 'hasPhone', 'verified']
     else:
         columns_to_drop = ['profile_pic_url', 'latest_story_ts', 'is_verified', 'is_private']
     followers_df = followers_df.drop(columns=columns_to_drop, errors='ignore')
@@ -212,14 +216,21 @@ def scrape_followers(
     for _, row in followers_df.iterrows():
         # Platform-specific field mapping
         if platform.lower() == 'tiktok':
-            # TikTok uses: nickname, followers, following, videos
+            # TikTok API can return different field names depending on the actor version
+            # Support multiple formats: uniqueId/unique_id/username for username field
+            # id field is the primary unique identifier (numeric string)
+            unique_id = row.get('uniqueId') or row.get('unique_id') or row.get('username', '')
             follower_data = {
-                'username': row.get('username', ''),
-                'full_name': row.get('nickname', ''),  # TikTok uses 'nickname'
-                'follower_count': row.get('followers', 0),  # TikTok uses 'followers'
-                'following_count': row.get('following', 0),  # TikTok uses 'following'
-                'posts_count': row.get('videos', 0),  # TikTok uses 'videos'
-                'id': str(row.get('id', row.get('username', '')))  # Ensure ID is string
+                'id': str(row.get('id', '')),  # Primary unique identifier (numeric string)
+                'username': unique_id,  # TikTok username (uniqueId/unique_id/username)
+                'full_name': row.get('nickname', ''),  # TikTok display name (used for gender check)
+                'follower_count': row.get('followerCount') or row.get('follower_count') or row.get('followers', 0),
+                'following_count': row.get('followingCount') or row.get('following_count') or row.get('following', 0),
+                'posts_count': row.get('videoCount') or row.get('aweme_count') or row.get('videos', 0),
+                'signature': row.get('signature', ''),  # TikTok bio/signature
+                'region': row.get('region', ''),  # TikTok region/country code (e.g., 'US', 'PK')
+                'sec_uid': row.get('secUid', ''),  # TikTok secure user ID
+                'url': row.get('url', ''),  # Profile URL
             }
         elif platform.lower() == 'threads':
             # Threads likely uses similar fields to Instagram (adjust as needed)
