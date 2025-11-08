@@ -120,6 +120,7 @@ def create_airtable_tables(
             logger.info(f"Creating table {i}/{num_tables}: {table_name}")
             
             # Create table with the required schema
+            # Schema supports multi-platform data (Instagram, TikTok, Threads, X/Twitter)
             table = base.create_table(
                 name=table_name,
                 fields=[
@@ -131,12 +132,25 @@ def create_airtable_tables(
                     {
                         "name": "username",
                         "type": "singleLineText",
-                        "description": "Instagram username"
+                        "description": "Social media username (platform-specific)"
                     },
                     {
                         "name": "full_name",
                         "type": "singleLineText",
                         "description": "Full name of the profile"
+                    },
+                    {
+                        "name": "platform",
+                        "type": "singleSelect",
+                        "description": "Social media platform",
+                        "options": {
+                            "choices": [
+                                {"name": "instagram"},
+                                {"name": "tiktok"},
+                                {"name": "threads"},
+                                {"name": "x"}
+                            ]
+                        }
                     },
                     {
                         "name": "position",

@@ -60,6 +60,8 @@ def batch_insert_profiles(
             logger.warning(f"Skipping profile with missing id or username: {profile}")
             continue
         
+        # Prepare profile with core fields only
+        # For X/Twitter: id_str -> id, screen_name -> username, name -> full_name
         valid_profiles.append({
             'id': str(profile['id']),
             'username': profile['username'],

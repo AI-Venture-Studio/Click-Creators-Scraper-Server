@@ -127,11 +127,15 @@ def scrape_followers(
             "max_count": max_count,
         }
     elif platform.lower() == 'x':
-        # X/Twitter actor - adjust as needed based on actual actor
+        # X/Twitter actor - uses specific format with getFollowers/getFollowing
         run_input = {
-            "usernames": accounts,
-            "max_count": max_count,
+            "user_names": accounts,  # X actor expects "user_names" not "usernames"
+            "getFollowers": True,    # Enable follower scraping
+            "getFollowing": True,    # Enable following scraping
+            "maxFollowers": max_count,   # Max followers per account
+            "maxFollowings": max_count,  # Max following per account
         }
+        logger.info(f"X/Twitter scraper input: {run_input}")
     else:
         # Instagram (default)
         run_input = {
@@ -228,14 +232,16 @@ def scrape_followers(
                 'id': row.get('id', row.get('username', ''))
             }
         elif platform.lower() == 'x':
-            # X/Twitter field mapping (adjust as needed based on actual actor response)
+            # X/Twitter field mapping - SIMPLIFIED to essential fields only
+            # Only capture: id_str, screen_name, name
             follower_data = {
-                'username': row.get('username', ''),
-                'full_name': row.get('name', ''),  # X uses 'name'
-                'follower_count': row.get('followers_count', 0),
-                'following_count': row.get('following_count', 0),
-                'posts_count': row.get('tweets_count', 0),
-                'id': row.get('id', row.get('username', ''))
+                'id': str(row.get('id_str', row.get('id', ''))),  # X uses 'id_str' (preferred) or 'id'
+                'username': row.get('screen_name', ''),  # X uses 'screen_name' for username
+                'full_name': row.get('name', ''),  # X uses 'name' for full name
+                # Set default values for compatibility with existing system
+                'follower_count': 0,
+                'following_count': 0,
+                'posts_count': 0,
             }
         else:
             # Instagram (default)
