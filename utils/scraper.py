@@ -125,11 +125,12 @@ def scrape_followers(
         }
         logger.info(f"TikTok usernames to scrape: {clean_usernames}")
     elif platform.lower() == 'threads':
-        # Threads actor - adjust as needed based on actual actor
+        # Threads actor expects: {"maxFollowers": 100, "usernames": ["username1", "username2"]}
         run_input = {
             "usernames": accounts,
-            "max_count": max_count,
+            "maxFollowers": max_count,
         }
+        logger.info(f"Threads usernames to scrape: {accounts}")
     elif platform.lower() == 'x':
         # X/Twitter actor - uses specific format with getFollowers/getFollowing
         run_input = {
